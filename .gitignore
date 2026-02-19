@@ -1,0 +1,9 @@
+.env.local
+.env
+*.env
+.venv/
+__pycache__/
+*.pyc
+.uv/
+uv.lock
+dist/
