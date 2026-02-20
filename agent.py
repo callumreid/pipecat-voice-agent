@@ -44,6 +44,7 @@ from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.openai import OpenAILLMService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
+from opentelemetry import trace as otel_trace
 from pipecat.utils.tracing.setup import setup_tracing
 
 load_dotenv(".env.local")
@@ -198,6 +199,11 @@ async def run_agent(room_url: str, token: str | None = None):
 
     runner = PipelineRunner()
     await runner.run(task)
+
+    # Flush all pending spans to Coval before the process exits.
+    # BatchSpanProcessor exports asynchronously — without this, the final
+    # batch (including the conversation root span) would be dropped.
+    otel_trace.get_tracer_provider().shutdown()
 
 
 async def main():
