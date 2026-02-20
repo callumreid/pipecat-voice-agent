@@ -45,7 +45,9 @@ from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.openai import OpenAILLMService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 from opentelemetry import trace as otel_trace
-from pipecat.utils.tracing.setup import setup_tracing
+from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
 load_dotenv(".env.local")
 
@@ -81,13 +83,20 @@ class DynamicCovalExporter(SpanExporter):
             timeout=self._timeout,
         )
         if self._buffer:
-            logger.debug(f"Flushing {len(self._buffer)} buffered spans to Coval")
-            self._inner.export(self._buffer)
+            logger.info(f"Flushing {len(self._buffer)} buffered spans to Coval")
+            result = self._inner.export(self._buffer)
+            logger.info(f"Buffered span flush result: {result}")
             self._buffer.clear()
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         if self._inner:
-            return self._inner.export(spans)
+            result = self._inner.export(spans)
+            if result != SpanExportResult.SUCCESS:
+                logger.error(f"Coval OTLP export failed for {len(spans)} spans: {result}")
+            else:
+                logger.debug(f"Exported {len(spans)} spans to Coval")
+            return result
+        logger.debug(f"Buffering {len(spans)} spans (no simulation_id yet)")
         self._buffer.extend(spans)
         return SpanExportResult.SUCCESS
 
@@ -116,15 +125,15 @@ async def run_agent(room_url: str, token: str | None = None):
 
     # Configure tracing before the pipeline starts so Pipecat's conversation span
     # is created against this provider from the start.
+    # Use SimpleSpanProcessor (synchronous) to avoid silent BatchSpanProcessor drop issues.
     api_key = os.getenv("COVAL_API_KEY")
     coval_exporter: Optional[DynamicCovalExporter] = None
     if api_key:
         coval_exporter = DynamicCovalExporter(api_key=api_key)
-        setup_tracing(
-            service_name="pipecat-voice-agent",
-            exporter=coval_exporter,
-            console_export=os.getenv("OTEL_CONSOLE_EXPORT", "").lower() == "true",
-        )
+        resource = Resource.create({SERVICE_NAME: "pipecat-voice-agent"})
+        provider = TracerProvider(resource=resource)
+        provider.add_span_processor(SimpleSpanProcessor(coval_exporter))
+        otel_trace.set_tracer_provider(provider)
         logger.info("Coval tracing initialized — waiting for simulation ID via SIP header")
     else:
         logger.warning("COVAL_API_KEY not set — tracing disabled")
