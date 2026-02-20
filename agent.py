@@ -4,8 +4,8 @@ Pipecat voice agent with OpenTelemetry tracing configured to send spans to Coval
 This agent is used for testing Coval's trace ingestion and viewer. It automatically
 emits structured spans for each conversation turn, STT, LLM, and TTS operation.
 
-The simulation_output_id is read dynamically from the SIP INVITE custom header
-X-Coval-Simulation-Id, which Coval sends via Telnyx when dialing into the agent.
+The simulation_output_id is read from the `on_dialin_connected` event via the SIP
+header X-Coval-Simulation-Id, which Coval sends via Telnyx when dialing in.
 Falls back to COVAL_SIMULATION_ID env var for manual testing.
 
 Environment variables:
@@ -43,28 +43,6 @@ load_dotenv(".env.local")
 SYSTEM_PROMPT = """You are a helpful voice assistant used for testing Coval's trace ingestion.
 Keep your responses concise and conversational. You may be asked about anything.
 If asked to call a tool you don't have, politely explain you don't have that capability."""
-
-
-def extract_simulation_id(participant: dict) -> str | None:
-    """Extract the simulation_output_id from a Daily SIP participant.
-
-    Coval sends X-Coval-Simulation-Id as a custom SIP header via Telnyx.
-    Daily surfaces custom SIP headers in the participant's sipHeaders field.
-    Falls back to the COVAL_SIMULATION_ID env var for manual testing.
-    """
-    # Daily surfaces custom SIP headers under sipHeaders in the participant object.
-    # The header name is lowercased by Daily: x-coval-simulation-id.
-    sip_headers = participant.get("sipHeaders") or participant.get("sip_headers") or {}
-    if isinstance(sip_headers, dict):
-        simulation_id = (
-            sip_headers.get("x-coval-simulation-id")
-            or sip_headers.get("X-Coval-Simulation-Id")
-        )
-        if simulation_id:
-            return simulation_id
-
-    # Fallback: env var for manual testing
-    return os.getenv("COVAL_SIMULATION_ID") or None
 
 
 def build_coval_exporter(simulation_id: str) -> OTLPSpanExporter | None:
@@ -131,22 +109,45 @@ async def run_agent(room_url: str, token: str | None = None):
         enable_turn_tracking=True,
     )
 
+    @transport.event_handler("on_dialin_connected")
+    async def on_dialin_connected(transport, data):
+        """Called when a SIP dialin connects. Extract simulation ID from SIP headers."""
+        logger.info(f"Dialin connected — full data: {data}")
+
+        simulation_id = None
+
+        # Daily exposes custom SIP headers in the dialin-connected event data.
+        # Coval sends X-Coval-Simulation-Id via Telnyx custom_headers.
+        sip_headers = data.get("sipHeaders") or data.get("sip_headers") or {}
+        if isinstance(sip_headers, dict):
+            simulation_id = (
+                sip_headers.get("x-coval-simulation-id")
+                or sip_headers.get("X-Coval-Simulation-Id")
+            )
+            if simulation_id:
+                logger.info(f"Got simulation_id from SIP header: {simulation_id}")
+
+        # Fallback: env var for manual testing
+        if not simulation_id:
+            simulation_id = os.getenv("COVAL_SIMULATION_ID") or None
+            if simulation_id:
+                logger.info(f"Got simulation_id from env var fallback: {simulation_id}")
+
+        if not simulation_id:
+            logger.warning("No simulation_id found in SIP headers or env — traces will not be sent to Coval")
+            return
+
+        exporter = build_coval_exporter(simulation_id)
+        if exporter:
+            setup_tracing(
+                service_name="pipecat-voice-agent",
+                exporter=exporter,
+                console_export=os.getenv("OTEL_CONSOLE_EXPORT", "").lower() == "true",
+            )
+
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport, participant):
-        logger.info(f"Participant joined: {participant.get('id')} | data: {participant}")
-
-        simulation_id = extract_simulation_id(participant)
-        if simulation_id:
-            exporter = build_coval_exporter(simulation_id)
-            if exporter:
-                setup_tracing(
-                    service_name="pipecat-voice-agent",
-                    exporter=exporter,
-                    console_export=os.getenv("OTEL_CONSOLE_EXPORT", "").lower() == "true",
-                )
-        else:
-            logger.warning("No simulation_id found — traces will not be sent to Coval")
-
+        logger.info(f"Participant joined: {participant.get('id')}")
         await task.queue_frames([context_aggregator.user().get_context_frame()])
 
     @transport.event_handler("on_participant_left")
