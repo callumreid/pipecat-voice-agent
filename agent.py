@@ -30,7 +30,11 @@ from typing import Optional, Sequence
 
 from dotenv import load_dotenv
 from loguru import logger
+import json
+
+import requests
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace.export import SpanExportResult as OTLPSpanExportResult
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
@@ -58,6 +62,94 @@ If asked to call a tool you don't have, politely explain you don't have that cap
 COVAL_TRACES_ENDPOINT = "https://api.coval.dev/v1/traces"
 
 
+def _span_to_otlp_json(span: ReadableSpan) -> dict:
+    """Convert a ReadableSpan to OTLP JSON format (resourceSpans structure)."""
+
+    def attrs(attributes) -> list:
+        if not attributes:
+            return []
+        result = []
+        for k, v in attributes.items():
+            if isinstance(v, bool):
+                result.append({"key": k, "value": {"boolValue": v}})
+            elif isinstance(v, int):
+                result.append({"key": k, "value": {"intValue": v}})
+            elif isinstance(v, float):
+                result.append({"key": k, "value": {"doubleValue": v}})
+            else:
+                result.append({"key": k, "value": {"stringValue": str(v)}})
+        return result
+
+    def hex_id(id_int: int, length: int) -> str:
+        return format(id_int, f"0{length * 2}x") if id_int else ""
+
+    context = span.context
+    span_dict = {
+        "traceId": hex_id(context.trace_id, 16) if context else "",
+        "spanId": hex_id(context.span_id, 8) if context else "",
+        "parentSpanId": hex_id(span.parent.span_id, 8) if span.parent else "",
+        "name": span.name,
+        "kind": span.kind.value,
+        "startTimeUnixNano": str(span.start_time) if span.start_time else "0",
+        "endTimeUnixNano": str(span.end_time) if span.end_time else "0",
+        "attributes": attrs(span.attributes),
+        "status": {"code": span.status.status_code.value, "message": span.status.description or ""},
+        "events": [],
+        "links": [],
+    }
+
+    resource_attrs = attrs(span.resource.attributes) if span.resource else []
+    return {
+        "resourceSpans": [{
+            "resource": {"attributes": resource_attrs},
+            "scopeSpans": [{
+                "scope": {"name": span.instrumentation_scope.name if span.instrumentation_scope else ""},
+                "spans": [span_dict],
+            }],
+        }]
+    }
+
+
+class _CovalJSONExporter(SpanExporter):
+    """Sends spans as OTLP JSON via plain HTTP requests. Avoids protobuf binary
+    encoding issues with API Gateway binary media type configuration."""
+
+    def __init__(self, api_key: str, simulation_id: str, endpoint: str, timeout: int):
+        self._api_key = api_key
+        self._simulation_id = simulation_id
+        self._endpoint = endpoint
+        self._timeout = timeout
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        for span in spans:
+            try:
+                payload = _span_to_otlp_json(span)
+                resp = requests.post(
+                    self._endpoint,
+                    json=payload,
+                    headers={
+                        "x-api-key": self._api_key,
+                        "X-Simulation-Id": self._simulation_id,
+                    },
+                    timeout=self._timeout,
+                )
+                if not resp.ok:
+                    logger.error(f"Coval trace export failed {resp.status_code}: {resp.text}")
+                    return SpanExportResult.FAILURE
+                else:
+                    logger.debug(f"Exported span '{span.name}' → {resp.status_code}")
+            except Exception as error:
+                logger.error(f"Coval trace export exception: {error}")
+                return SpanExportResult.FAILURE
+        return SpanExportResult.SUCCESS
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
+
+    def shutdown(self) -> None:
+        pass
+
+
 class DynamicCovalExporter(SpanExporter):
     """OTLP span exporter that buffers spans until the Coval simulation ID is known.
 
@@ -74,12 +166,11 @@ class DynamicCovalExporter(SpanExporter):
         self._buffer: list[ReadableSpan] = []
 
     def set_simulation_id(self, simulation_id: str) -> None:
-        self._inner = OTLPSpanExporter(
+        self._simulation_id = simulation_id
+        self._inner = _CovalJSONExporter(
+            api_key=self._api_key,
+            simulation_id=simulation_id,
             endpoint=self._endpoint,
-            headers={
-                "X-API-Key": self._api_key,
-                "X-Simulation-Id": simulation_id,
-            },
             timeout=self._timeout,
         )
         if self._buffer:
