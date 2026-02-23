@@ -1,0 +1,15 @@
+agent_name = "coval-pipecat-agent"
+
+# Docker image: rebuild with `docker buildx build --platform linux/arm64 --load -t callumcoval/coval-pipecat-agent:latest .`
+# then push: `docker push callumcoval/coval-pipecat-agent:latest`
+# then redeploy: `pcc deploy --force --no-credentials`
+image = "callumcoval/coval-pipecat-agent:latest"
+
+# Secrets created via: pcc secrets set --skip coval-pipecat-secrets KEY=value ...
+secret_set = "coval-pipecat-secrets"
+
+[scaling]
+# min_agents = 0 means scale-to-zero (KEDA scales up on demand when a sim queues a session)
+# Increase to 1 if you need a warm pod with no cold start (costs $$ when idle)
+min_agents = 0
+max_agents = 5

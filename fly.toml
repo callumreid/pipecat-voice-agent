@@ -1,0 +1,13 @@
+app = "coval-pipecat-agent"
+primary_region = "sjc"
+
+[build]
+
+# Worker process — no HTTP service, always running
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[restart]
+  policy = "always"

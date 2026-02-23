@@ -1,46 +1,30 @@
 """
-Pipecat voice agent with OpenTelemetry tracing configured to send spans to Coval.
+Pipecat voice agent with OpenTelemetry tracing for Coval simulation testing.
 
-This agent is used for testing Coval's trace ingestion and viewer. It automatically
-emits structured spans for each conversation turn, STT, LLM, and TTS operation.
+Cloud: async def bot(args) is called by Pipecat Cloud base image per session.
+       args.room_url and args.token are injected by the platform.
+Local: python bot.py — reads DAILY_ROOM_URL / DAILY_TOKEN from .env.local.
 
-Tracing architecture:
-  - DynamicCovalExporter is configured before the pipeline starts, so Pipecat's
-    conversation root span is created against the correct TracerProvider from the start.
-  - Spans are buffered internally until X-Coval-Simulation-Id arrives via the
-    on_dialin_connected SIP event, at which point all buffered spans are flushed
-    to Coval and new spans export normally.
-  - Falls back to COVAL_SIMULATION_ID env var for manual testing (set it before
-    the call connects and it will be used when on_dialin_connected fires).
-
-Environment variables:
-  DAILY_ROOM_URL          - Daily room URL to join
-  DAILY_TOKEN             - Daily token (optional, for private rooms)
-  OPENAI_API_KEY          - OpenAI API key
-  DEEPGRAM_API_KEY        - Deepgram API key (STT)
-  CARTESIA_API_KEY        - Cartesia API key (TTS)
-  COVAL_API_KEY           - Coval organization API key
-  COVAL_SIMULATION_ID     - Fallback simulation output ID for manual testing
-  OTEL_CONSOLE_EXPORT     - Set to "true" to also print spans to stdout
+Tracing: DynamicCovalExporter buffers spans until X-Coval-Simulation-Id arrives
+         via the on_dialin_connected SIP event, then flushes them all to Coval.
+         Falls back to COVAL_SIMULATION_ID env var for manual testing.
 """
 
 import asyncio
 import os
 import random
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Sequence
-
-from duckduckgo_search import DDGS
-
-from dotenv import load_dotenv
-from loguru import logger
-import json
+from typing import Any, Optional, Sequence
 
 import requests
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.trace.export import SpanExportResult as OTLPSpanExportResult
-from opentelemetry.sdk.trace import ReadableSpan
-from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from dotenv import load_dotenv
+from loguru import logger
+
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import EndFrame
@@ -48,16 +32,12 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.services.cartesia import CartesiaTTSService
-from pipecat.services.deepgram import DeepgramSTTService
-from pipecat.services.openai import OpenAILLMService
-from pipecat.transports.services.daily import DailyParams, DailyTransport
-from opentelemetry import trace as otel_trace
-from opentelemetry.sdk.resources import SERVICE_NAME, Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.transports.daily.transport import DailyDialinSettings, DailyParams, DailyTransport
 
-load_dotenv(".env.local")
+load_dotenv(override=True)
 
 SYSTEM_PROMPT = """You are a helpful voice assistant used for testing Coval's trace ingestion.
 Keep your responses concise and conversational. You have access to tools — use them when relevant:
@@ -68,6 +48,8 @@ Keep your responses concise and conversational. You have access to tools — use
 
 COVAL_TRACES_ENDPOINT = "https://api.coval.dev/v1/traces"
 
+
+# ── Tracing ────────────────────────────────────────────────────────────────────
 
 def _span_to_otlp_json(span: ReadableSpan) -> dict:
     """Convert a ReadableSpan to OTLP JSON format (resourceSpans structure)."""
@@ -118,8 +100,8 @@ def _span_to_otlp_json(span: ReadableSpan) -> dict:
 
 
 class _CovalJSONExporter(SpanExporter):
-    """Sends spans as OTLP JSON via plain HTTP requests. Avoids protobuf binary
-    encoding issues with API Gateway binary media type configuration."""
+    """Sends spans as OTLP JSON via plain HTTP. Avoids protobuf binary encoding
+    issues with API Gateway binary media type configuration."""
 
     def __init__(self, api_key: str, simulation_id: str, endpoint: str, timeout: int):
         self._api_key = api_key
@@ -163,22 +145,23 @@ class DynamicCovalExporter(SpanExporter):
     Configured before the pipeline starts so Pipecat's conversation root span is
     captured from the start. When set_simulation_id() is called (on SIP dialin),
     all buffered spans are flushed to Coval and subsequent spans export normally.
+
+    reset() clears state between sessions on the same warm process instance.
     """
 
     def __init__(self, api_key: str, endpoint: str = COVAL_TRACES_ENDPOINT, timeout: int = 30):
         self._api_key = api_key
         self._endpoint = endpoint
         self._timeout = timeout
-        self._inner: Optional[OTLPSpanExporter] = None
+        self._inner: Optional[_CovalJSONExporter] = None
         self._buffer: list[ReadableSpan] = []
 
     def reset(self) -> None:
-        """Reset state for a new call in keep-alive mode."""
+        """Clear state for a new session (called at the start of each bot() invocation)."""
         self._inner = None
         self._buffer.clear()
 
     def set_simulation_id(self, simulation_id: str) -> None:
-        self._simulation_id = simulation_id
         self._inner = _CovalJSONExporter(
             api_key=self._api_key,
             simulation_id=simulation_id,
@@ -193,12 +176,7 @@ class DynamicCovalExporter(SpanExporter):
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         if self._inner:
-            result = self._inner.export(spans)
-            if result != SpanExportResult.SUCCESS:
-                logger.error(f"Coval OTLP export failed for {len(spans)} spans: {result}")
-            else:
-                logger.debug(f"Exported {len(spans)} spans to Coval")
-            return result
+            return self._inner.export(spans)
         logger.debug(f"Buffering {len(spans)} spans (no simulation_id yet)")
         self._buffer.extend(spans)
         return SpanExportResult.SUCCESS
@@ -212,6 +190,30 @@ class DynamicCovalExporter(SpanExporter):
         if self._inner:
             self._inner.shutdown()
 
+
+# Tracing is set up once per process (Pipecat Cloud reuses warm instances across calls).
+# reset() is called at the start of each bot() invocation to clear per-session state.
+_coval_exporter: Optional[DynamicCovalExporter] = None
+
+
+def _init_tracing() -> None:
+    global _coval_exporter
+    api_key = os.getenv("COVAL_API_KEY")
+    if not api_key:
+        logger.warning("COVAL_API_KEY not set — tracing disabled")
+        return
+    _coval_exporter = DynamicCovalExporter(api_key=api_key)
+    resource = Resource.create({SERVICE_NAME: "pipecat-voice-agent"})
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(SimpleSpanProcessor(_coval_exporter))
+    otel_trace.set_tracer_provider(provider)
+    logger.info("Coval tracing initialized")
+
+
+_init_tracing()
+
+
+# ── Tools ──────────────────────────────────────────────────────────────────────
 
 TOOLS = [
     {
@@ -247,10 +249,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query",
-                    },
+                    "query": {"type": "string", "description": "The search query"},
                     "max_results": {
                         "type": "integer",
                         "description": "Maximum number of results to return (1-5, default 3)",
@@ -279,14 +278,13 @@ TOOLS = [
     },
 ]
 
+_WEATHER_CONDITIONS = ["sunny", "cloudy", "partly cloudy", "rainy", "windy", "foggy"]
+_ORDER_STATUSES = ["processing", "shipped", "out for delivery", "delivered", "delayed"]
+
 
 async def tool_get_current_time(function_name, tool_call_id, args, llm, context, result_callback):
     now = datetime.now()
     await result_callback({"time": now.strftime("%I:%M %p"), "date": now.strftime("%A, %B %d, %Y")})
-
-
-_WEATHER_CONDITIONS = ["sunny", "cloudy", "partly cloudy", "rainy", "windy", "foggy"]
-_ORDER_STATUSES = ["processing", "shipped", "out for delivery", "delivered", "delayed"]
 
 
 async def tool_get_weather(function_name, tool_call_id, args, llm, context, result_callback):
@@ -300,6 +298,7 @@ async def tool_get_weather(function_name, tool_call_id, args, llm, context, resu
 
 
 async def tool_search_web(function_name, tool_call_id, args, llm, context, result_callback):
+    from duckduckgo_search import DDGS
     query = args.get("query", "")
     max_results = min(int(args.get("max_results", 3)), 5)
     try:
@@ -317,28 +316,52 @@ async def tool_lookup_order_status(function_name, tool_call_id, args, llm, conte
     await result_callback({
         "order_id": order_id,
         "status": random.choice(_ORDER_STATUSES),
-        "estimated_delivery": "Feb 24, 2026",
+        "estimated_delivery": "Mar 1, 2026",
         "carrier": random.choice(["UPS", "FedEx", "USPS", "DHL"]),
     })
 
 
-async def run_agent(room_url: str, token: str | None = None, coval_exporter: Optional[DynamicCovalExporter] = None):
+# ── Bot entry point ────────────────────────────────────────────────────────────
+
+async def bot(args: Any) -> None:
+    """
+    Called by Pipecat Cloud per session (args.room_url + args.token injected by platform).
+    Also callable directly for local dev — pass any object with .room_url / .token.
+    """
+    logger.info(f"Session started: room={args.room_url}")
+
+    if _coval_exporter:
+        _coval_exporter.reset()
+
+    # Extract dialin_settings from body (passed by PCC's pinless dial-in webhook)
+    body = getattr(args, "body", None) or {}
+    dialin_settings = None
+    if isinstance(body, dict):
+        raw = body.get("dialin_settings")
+        if raw:
+            dialin_settings = DailyDialinSettings(
+                call_id=raw.get("callId") or raw.get("call_id", ""),
+                call_domain=raw.get("callDomain") or raw.get("call_domain", ""),
+            )
+            logger.info(f"Dial-in session: call_id={dialin_settings.call_id}")
+
     transport = DailyTransport(
-        room_url,
-        token,
+        args.room_url,
+        args.token,
         "Pipecat Test Agent",
         DailyParams(
+            api_key=os.getenv("DAILY_API_KEY", ""),
             audio_out_enabled=True,
             transcription_enabled=False,
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(),
+            dialin_settings=dialin_settings,
         ),
     )
 
     @transport.event_handler("on_dialin_connected")
     async def on_dialin_connected(transport, data):
         logger.info(f"Dialin connected — data: {data}")
-
         simulation_id = None
         sip_headers = data.get("sipHeaders") or data.get("sip_headers") or {}
         if isinstance(sip_headers, dict):
@@ -348,14 +371,12 @@ async def run_agent(room_url: str, token: str | None = None, coval_exporter: Opt
             )
             if simulation_id:
                 logger.info(f"Got simulation_id from SIP header: {simulation_id}")
-
         if not simulation_id:
             simulation_id = os.getenv("COVAL_SIMULATION_ID") or None
             if simulation_id:
                 logger.info(f"Got simulation_id from env var fallback: {simulation_id}")
-
-        if simulation_id and coval_exporter:
-            coval_exporter.set_simulation_id(simulation_id)
+        if simulation_id and _coval_exporter:
+            _coval_exporter.set_simulation_id(simulation_id)
             logger.info(f"Coval tracing active for simulation_id={simulation_id}")
         else:
             logger.warning("No simulation_id — spans will be discarded")
@@ -376,17 +397,15 @@ async def run_agent(room_url: str, token: str | None = None, coval_exporter: Opt
     context = OpenAILLMContext(messages, TOOLS)
     context_aggregator = llm.create_context_aggregator(context)
 
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            context_aggregator.user(),
-            llm,
-            tts,
-            transport.output(),
-            context_aggregator.assistant(),
-        ]
-    )
+    pipeline = Pipeline([
+        transport.input(),
+        stt,
+        context_aggregator.user(),
+        llm,
+        tts,
+        transport.output(),
+        context_aggregator.assistant(),
+    ])
 
     task = PipelineTask(
         pipeline,
@@ -408,46 +427,30 @@ async def run_agent(room_url: str, token: str | None = None, coval_exporter: Opt
         logger.info(f"Participant left: {participant.get('id')} reason={reason}")
         await task.queue_frames([EndFrame()])
 
-    runner = PipelineRunner()
+    handle_sigint = getattr(args, "handle_sigint", False)
+    runner = PipelineRunner(handle_sigint=handle_sigint)
     await runner.run(task)
 
 
-async def main():
-    room_url = os.getenv("DAILY_ROOM_URL")
-    token = os.getenv("DAILY_TOKEN")
-
-    if not room_url:
-        raise ValueError("DAILY_ROOM_URL must be set")
-
-    # Set up tracing once — reused across restarts.
-    # SimpleSpanProcessor is synchronous so spans aren't dropped on restart.
-    api_key = os.getenv("COVAL_API_KEY")
-    coval_exporter: Optional[DynamicCovalExporter] = None
-    if api_key:
-        coval_exporter = DynamicCovalExporter(api_key=api_key)
-        resource = Resource.create({SERVICE_NAME: "pipecat-voice-agent"})
-        provider = TracerProvider(resource=resource)
-        provider.add_span_processor(SimpleSpanProcessor(coval_exporter))
-        otel_trace.set_tracer_provider(provider)
-        logger.info("Coval tracing initialized — waiting for simulation ID via SIP header")
-    else:
-        logger.warning("COVAL_API_KEY not set — tracing disabled")
-
-    try:
-        while True:
-            logger.info("Agent ready — waiting for call...")
-            if coval_exporter:
-                coval_exporter.reset()
-            try:
-                await run_agent(room_url, token, coval_exporter)
-            except Exception as e:
-                logger.error(f"Agent error: {e}")
-            logger.info("Call ended. Restarting in 2 seconds...")
-            await asyncio.sleep(2)
-    finally:
-        # Flush remaining spans on clean exit (Ctrl+C, SIGTERM).
-        otel_trace.get_tracer_provider().shutdown()
-
+# ── Local dev entrypoint ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    @dataclass
+    class _LocalArgs:
+        room_url: str
+        token: str = ""
+        body: Any = None
+        session_id: Optional[str] = None
+        handle_sigint: bool = True  # handle Ctrl+C locally
+
+    room_url = os.getenv("DAILY_ROOM_URL", "")
+    if not room_url:
+        raise SystemExit("DAILY_ROOM_URL not set — add it to .env.local")
+
+    _args = _LocalArgs(room_url=room_url, token=os.getenv("DAILY_TOKEN", ""))
+    logger.info(f"Local dev — joining room: {room_url}")
+
+    try:
+        asyncio.run(bot(_args))
+    finally:
+        otel_trace.get_tracer_provider().shutdown()
