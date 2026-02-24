@@ -9,7 +9,7 @@ image = "callumcoval/coval-pipecat-agent:latest"
 secret_set = "coval-pipecat-secrets"
 
 [scaling]
-# min_agents = 0 means scale-to-zero (KEDA scales up on demand when a sim queues a session)
-# Increase to 1 if you need a warm pod with no cold start (costs $$ when idle)
-min_agents = 0
+# min_agents = 1 keeps one warm pod always ready — eliminates ~10 min cold start from scale-to-zero.
+# The Coval simulator's 60s idle timeout is not long enough to survive a cold start, so 0 breaks sims.
+min_agents = 1
 max_agents = 5
