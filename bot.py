@@ -5,9 +5,9 @@ Cloud: async def bot(args) is called by Pipecat Cloud base image per session.
        args.room_url and args.token are injected by the platform.
 Local: python bot.py — reads DAILY_ROOM_URL / DAILY_TOKEN from .env.local.
 
-Tracing: DynamicCovalExporter buffers spans until X-Coval-Simulation-Id arrives
-         via the on_dialin_connected SIP event, then flushes them all to Coval.
-         Falls back to COVAL_SIMULATION_ID env var for manual testing.
+Tracing: DynamicCovalExporter buffers spans until simulation_id is known.
+         Primary: X-Coval-Simulation-Id SIP header via on_dialin_connected event.
+         Fallback: COVAL_SIMULATION_ID env var (set at startup for local testing).
 """
 
 import asyncio
@@ -32,7 +32,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.daily.transport import DailyDialinSettings, DailyParams, DailyTransport
@@ -359,8 +359,16 @@ async def bot(args: Any) -> None:
         ),
     )
 
+    # For local testing: if COVAL_SIMULATION_ID is set, activate tracing immediately
+    # (on_dialin_connected won't fire for non-SIP connections like direct room joins)
+    env_simulation_id = os.getenv("COVAL_SIMULATION_ID")
+    if env_simulation_id and _coval_exporter:
+        _coval_exporter.set_simulation_id(env_simulation_id)
+        logger.info(f"Coval tracing active from env var: simulation_id={env_simulation_id}")
+
     @transport.event_handler("on_dialin_connected")
     async def on_dialin_connected(transport, data):
+        """Extract simulation_id from SIP headers on dial-in connections."""
         logger.info(f"Dialin connected — data: {data}")
         simulation_id = None
         sip_headers = data.get("sipHeaders") or data.get("sip_headers") or {}
@@ -382,10 +390,7 @@ async def bot(args: Any) -> None:
             logger.warning("No simulation_id — spans will be discarded")
 
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id=os.getenv("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
-    )
+    tts = DeepgramTTSService(api_key=os.getenv("DEEPGRAM_API_KEY"))
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
 
     llm.register_function("get_current_time", tool_get_current_time)
