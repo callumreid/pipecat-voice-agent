@@ -1,0 +1,9 @@
+agent_name = "coval-pipecat-otel-test"
+
+image = "callumcoval/coval-pipecat-otel-test:latest"
+
+secret_set = "coval-pipecat-secrets"
+
+[scaling]
+min_agents = 1
+max_agents = 2

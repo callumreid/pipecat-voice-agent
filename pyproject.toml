@@ -1,0 +1,15 @@
+[project]
+name = "pipecat-voice-agent"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pipecatcloud",
+    "pipecat-ai[daily,deepgram,openai,cartesia,silero,tracing]>=0.0.60",
+    "python-dotenv>=1.0.0",
+    "loguru>=0.7.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
+    "requests>=2.31.0",
+    "psycopg2-binary>=2.9.11",
+    "boto3>=1.42.53",
+    "duckduckgo-search>=8.1.1",
+]

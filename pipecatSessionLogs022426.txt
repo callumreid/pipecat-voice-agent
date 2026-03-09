@@ -1,0 +1,57 @@
+
+Feb 24 12:03:10.478
+2026-02-24 20:03:10.478 | DEBUG | pipecat.services.deepgram.stt:_disconnect:283 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Disconnecting from Deepgram
+Feb 24 12:03:10.478
+2026-02-24 20:03:10.478 | DEBUG | pipecat.pipeline.task:_wait_for_pipeline_end:745 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - PipelineTask#1: Closing. Waiting for EndFrame#1(reason: None) to reach the end of the pipeline...
+Feb 24 12:03:10.478
+2026-02-24 20:03:10.478 | INFO | bot:on_participant_left:435 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Participant left: cc8be24d-cb0d-4055-a2d5-51af989a3ac7 reason=leftCall
+Feb 24 12:03:10.478
+2026-02-24 20:03:10.477 | INFO | pipecat.transports.daily.transport:_on_participant_left:2723 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Participant left cc8be24d-cb0d-4055-a2d5-51af989a3ac7
+Feb 24 12:02:15.469
+2026-02-24 20:02:15.469 | DEBUG | pipecat.utils.tracing.turn_trace_observer:_handle_turn_ended:231 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Ended tracing for Turn 3
+Feb 24 12:02:15.469
+2026-02-24 20:02:15.469 | DEBUG | bot:export:180 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Buffering 1 spans (no simulation_id yet)
+Feb 24 12:02:12.968
+2026-02-24 20:02:12.968 | DEBUG | pipecat.transports.base_output:_bot_stopped_speaking:647 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Bot stopped speaking
+Feb 24 12:02:12.241
+2026-02-24 20:02:12.241 | WARNING | pipecat.pipeline.task:_source_push_frame:881 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - PipelineTask#1: Something went wrong: ErrorFrame#46(error: Unknown error occurred: server rejected WebSocket connection: HTTP 402, fatal: False)
+Feb 24 12:02:12.241
+2026-02-24 20:02:12.241 | DEBUG | bot:export:180 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Buffering 1 spans (no simulation_id yet)
+Feb 24 12:02:12.241
+2026-02-24 20:02:12.241 | ERROR | pipecat.processors.frame_processor:push_error_frame:745 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - CartesiaTTSService#3 exception (/app/.venv/lib/python3.12/site-packages/websockets/client.py:142): Unknown error occurred: server rejected WebSocket connection: HTTP 402
+Feb 24 12:02:12.058
+2026-02-24 20:02:12.058 | WARNING | pipecat.pipeline.task:_source_push_frame:881 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - PipelineTask#1: Something went wrong: ErrorFrame#45(error: Unknown error occurred: Websocket not connected, fatal: False)
+Feb 24 12:02:12.058
+2026-02-24 20:02:12.057 | WARNING | pipecat.pipeline.task:_source_push_frame:881 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - PipelineTask#1: Something went wrong: ErrorFrame#44(error: Unknown error occurred: server rejected WebSocket connection: HTTP 402, fatal: False)
+Feb 24 12:02:12.050
+2026-02-24 20:02:12.050 | DEBUG | pipecat.services.cartesia.tts:_connect_websocket:504 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Connecting to Cartesia TTS
+Feb 24 12:02:12.050
+2026-02-24 20:02:12.050 | DEBUG | pipecat.processors.metrics.frame_processor_metrics:stop_processing_metrics:173 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - CartesiaTTSService#3 processing time: 0.235s
+Feb 24 12:02:12.050
+2026-02-24 20:02:12.050 | DEBUG | pipecat.processors.metrics.frame_processor_metrics:stop_ttfb_metrics:141 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - CartesiaTTSService#3 TTFB: 0.000s
+Feb 24 12:02:12.050
+2026-02-24 20:02:12.050 | DEBUG | pipecat.services.tts_service:push_frame:521 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - CartesiaTTSService#3 cleaning up TTS context 373283f0-7712-40b7-a078-af7cd2afcd30
+Feb 24 12:02:12.050
+2026-02-24 20:02:12.050 | ERROR | pipecat.processors.frame_processor:push_error_frame:745 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - CartesiaTTSService#3 error: Unknown error occurred: Websocket not connected
+Feb 24 12:02:12.050
+2026-02-24 20:02:12.050 | ERROR | pipecat.processors.frame_processor:push_error_frame:745 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - CartesiaTTSService#3 exception (/app/.venv/lib/python3.12/site-packages/websockets/client.py:142): Unknown error occurred: server rejected WebSocket connection: HTTP 402
+Feb 24 12:02:11.822
+2026-02-24 20:02:11.822 | WARNING | pipecat.pipeline.task:_source_push_frame:881 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - PipelineTask#1: Something went wrong: ErrorFrame#43(error: Unknown error occurred: server rejected WebSocket connection: HTTP 402, fatal: False)
+Feb 24 12:02:11.815
+2026-02-24 20:02:11.815 | DEBUG | pipecat.services.cartesia.tts:_connect_websocket:504 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Connecting to Cartesia TTS
+Feb 24 12:02:11.815
+2026-02-24 20:02:11.815 | DEBUG | pipecat.services.cartesia.tts:run_tts:604 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - CartesiaTTSService#3: Generating TTS [Do you have the order ID for your sneakers?]
+Feb 24 12:02:11.815
+2026-02-24 20:02:11.814 | DEBUG | bot:export:180 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Buffering 1 spans (no simulation_id yet)
+Feb 24 12:02:11.814
+2026-02-24 20:02:11.814 | ERROR | pipecat.processors.frame_processor:push_error_frame:745 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - CartesiaTTSService#3 exception (/app/.venv/lib/python3.12/site-packages/websockets/client.py:142): Unknown error occurred: server rejected WebSocket connection: HTTP 402
+Feb 24 12:02:11.620
+2026-02-24 20:02:11.620 | DEBUG | pipecat.processors.metrics.frame_processor_metrics:stop_processing_metrics:173 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - OpenAILLMService#1 processing time: 1.405s
+Feb 24 12:02:11.620
+2026-02-24 20:02:11.620 | DEBUG | bot:export:180 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Buffering 1 spans (no simulation_id yet)
+Feb 24 12:02:11.616
+2026-02-24 20:02:11.616 | DEBUG | pipecat.utils.tracing.turn_trace_observer:_handle_latency_measured:101 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - Turn 3 user-bot latency: 2.242s
+Feb 24 12:02:11.616
+2026-02-24 20:02:11.616 | WARNING | pipecat.pipeline.task:_source_push_frame:881 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - PipelineTask#1: Something went wrong: ErrorFrame#42(error: Unknown error occurred: Websocket not connected, fatal: False)
+Feb 24 12:02:11.616
+2026-02-24 20:02:11.616 | WARNING | pipecat.pipeline.task:_source_push_frame:881 | f5eab1cd-61f6-471a-8adb-1655f08e9240 - PipelineTask#1: Something went wrong: ErrorFrame#41(error: Unknown error occurred: server rejected WebSocket connection: HTTP 402, fatal: False)
