@@ -500,6 +500,18 @@ async def bot(args: Any) -> None:
                 call_domain=raw.get("callDomain") or raw.get("call_domain", ""),
             )
             logger.info(f"Dial-in session: call_id={dialin_settings.call_id}")
+            # Daily does not forward custom SIP headers to on_dialin_connected.
+            # Extract simulation_id from the sip_headers that the webhook received
+            # from Daily's pinless dial-in and passed through in the request body.
+            sip_headers_from_body = raw.get("sip_headers") or {}
+            if isinstance(sip_headers_from_body, dict):
+                sip_sim_id = (
+                    sip_headers_from_body.get("X-Coval-Simulation-Id")
+                    or sip_headers_from_body.get("x-coval-simulation-id")
+                )
+                if sip_sim_id and _coval_exporter:
+                    _coval_exporter.set_simulation_id(sip_sim_id)
+                    logger.info(f"Coval tracing active from body.dialin_settings.sip_headers: {sip_sim_id}")
 
     transport = DailyTransport(
         args.room_url,
