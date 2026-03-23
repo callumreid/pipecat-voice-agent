@@ -13,6 +13,7 @@ Tracing: DynamicCovalExporter buffers spans until simulation_id is known.
 import asyncio
 import os
 import random
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional, Sequence
@@ -27,11 +28,22 @@ from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndFrame
+from pipecat.frames.frames import (
+    EndFrame,
+    InterimTranscriptionFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMMessagesFrame,
+    TranscriptionFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+    UserStartedSpeakingFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
@@ -211,6 +223,150 @@ def _init_tracing() -> None:
 
 
 _init_tracing()
+
+
+# ── Coval OTel span processors ─────────────────────────────────────────────────
+
+
+class STTSpanProcessor(FrameProcessor):
+    """Emits Coval-standard 'stt' spans for each final STT transcription.
+
+    Span attributes:
+      stt.transcription  — the transcribed text (required for STT WER metric)
+      metrics.ttfb       — seconds from user started speaking to first result
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._tracer = otel_trace.get_tracer("coval.stt")
+        self._speech_start_time: Optional[float] = None
+        self._first_result_time: Optional[float] = None
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, UserStartedSpeakingFrame):
+            self._speech_start_time = time.time()
+            self._first_result_time = None
+
+        elif isinstance(frame, InterimTranscriptionFrame):
+            if self._first_result_time is None and self._speech_start_time:
+                self._first_result_time = time.time()
+
+        elif isinstance(frame, TranscriptionFrame) and frame.text and frame.text.strip():
+            now = time.time()
+            if self._first_result_time is None:
+                self._first_result_time = now
+
+            ttfb = 0.0
+            if self._speech_start_time:
+                ttfb = self._first_result_time - self._speech_start_time
+
+            with self._tracer.start_as_current_span("stt") as span:
+                span.set_attribute("stt.transcription", frame.text)
+                span.set_attribute("metrics.ttfb", round(ttfb, 4))
+
+            self._speech_start_time = None
+            self._first_result_time = None
+
+        await self.push_frame(frame, direction)
+
+
+class _LLMTiming:
+    """Shared mutable timing state passed between the two LLM span processors."""
+
+    request_start: Optional[float] = None
+    first_token_time: Optional[float] = None
+
+
+class LLMPreSpanProcessor(FrameProcessor):
+    """Records when an LLM context frame is dispatched (placed before the LLM service).
+
+    Works in tandem with LLMPostSpanProcessor (placed after the LLM service) via a
+    shared _LLMTiming instance to compute accurate TTFB.
+    """
+
+    def __init__(self, timing: _LLMTiming, **kwargs):
+        super().__init__(**kwargs)
+        self._timing = timing
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMMessagesFrame) and direction == FrameDirection.DOWNSTREAM:
+            self._timing.request_start = time.time()
+            self._timing.first_token_time = None
+        await self.push_frame(frame, direction)
+
+
+class LLMPostSpanProcessor(FrameProcessor):
+    """Emits Coval-standard 'llm' spans once each LLM turn completes (placed after LLM service).
+
+    Span attributes:
+      metrics.ttfb  — seconds from context dispatched to first response token
+    """
+
+    def __init__(self, timing: _LLMTiming, **kwargs):
+        super().__init__(**kwargs)
+        self._timing = timing
+        self._tracer = otel_trace.get_tracer("coval.llm")
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMFullResponseStartFrame):
+            if self._timing.request_start is not None and self._timing.first_token_time is None:
+                self._timing.first_token_time = time.time()
+
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            if self._timing.request_start is not None:
+                ttfb = (
+                    (self._timing.first_token_time - self._timing.request_start)
+                    if self._timing.first_token_time
+                    else 0.0
+                )
+                with self._tracer.start_as_current_span("llm") as span:
+                    span.set_attribute("metrics.ttfb", round(ttfb, 4))
+                self._timing.request_start = None
+                self._timing.first_token_time = None
+
+        await self.push_frame(frame, direction)
+
+
+class TTSSpanProcessor(FrameProcessor):
+    """Emits Coval-standard 'tts' spans around each TTS synthesis.
+
+    Span attributes:
+      metrics.ttfb  — seconds from text sent to first audio byte
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._tracer = otel_trace.get_tracer("coval.tts")
+        self._request_start: Optional[float] = None
+        self._first_audio_time: Optional[float] = None
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TTSStartedFrame):
+            # TTS service is about to start synthesising — record request time.
+            self._request_start = time.time()
+            self._first_audio_time = None
+
+        elif isinstance(frame, TTSStoppedFrame):
+            # TTS synthesis complete — emit the span.
+            if self._request_start is not None:
+                ttfb = (
+                    (self._first_audio_time - self._request_start)
+                    if self._first_audio_time
+                    else 0.0
+                )
+                with self._tracer.start_as_current_span("tts") as span:
+                    span.set_attribute("metrics.ttfb", round(ttfb, 4))
+                self._request_start = None
+                self._first_audio_time = None
+
+        await self.push_frame(frame, direction)
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
@@ -402,12 +558,17 @@ async def bot(args: Any) -> None:
     context = OpenAILLMContext(messages, TOOLS)
     context_aggregator = llm.create_context_aggregator(context)
 
+    llm_timing = _LLMTiming()
     pipeline = Pipeline([
         transport.input(),
         stt,
+        STTSpanProcessor(),                       # Emits 'stt' spans: stt.transcription + metrics.ttfb
         context_aggregator.user(),
+        LLMPreSpanProcessor(timing=llm_timing),   # Records LLM request start time
         llm,
+        LLMPostSpanProcessor(timing=llm_timing),  # Emits 'llm' spans: metrics.ttfb
         tts,
+        TTSSpanProcessor(),                       # Emits 'tts' spans: metrics.ttfb
         transport.output(),
         context_aggregator.assistant(),
     ])
