@@ -515,10 +515,18 @@ async def bot(args: Any) -> None:
         ),
     )
 
+    # Extract simulation_id from the PCC start request body (Coval passes it in body.coval).
+    # This is the primary path for Coval-initiated sessions.
+    coval_body = body.get("coval", {}) if isinstance(body, dict) else {}
+    body_simulation_id = coval_body.get("simulationOutputId") if isinstance(coval_body, dict) else None
+    if body_simulation_id and _coval_exporter:
+        _coval_exporter.set_simulation_id(body_simulation_id)
+        logger.info(f"Coval tracing active from body.coval.simulationOutputId: {body_simulation_id}")
+
     # For local testing: if COVAL_SIMULATION_ID is set, activate tracing immediately
     # (on_dialin_connected won't fire for non-SIP connections like direct room joins)
     env_simulation_id = os.getenv("COVAL_SIMULATION_ID")
-    if env_simulation_id and _coval_exporter:
+    if not body_simulation_id and env_simulation_id and _coval_exporter:
         _coval_exporter.set_simulation_id(env_simulation_id)
         logger.info(f"Coval tracing active from env var: simulation_id={env_simulation_id}")
 
