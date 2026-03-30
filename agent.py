@@ -30,6 +30,10 @@ import random
 from datetime import datetime
 from typing import Optional, Sequence
 
+from coval_trace_instrumentation import (
+    CovalDeepgramSTTService,
+    CovalOpenAILLMService,
+)
 from duckduckgo_search import DDGS
 
 from dotenv import load_dotenv
@@ -49,8 +53,6 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.cartesia import CartesiaTTSService
-from pipecat.services.deepgram import DeepgramSTTService
-from pipecat.services.openai import OpenAILLMService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
@@ -360,12 +362,12 @@ async def run_agent(room_url: str, token: str | None = None, coval_exporter: Opt
         else:
             logger.warning("No simulation_id — spans will be discarded")
 
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    stt = CovalDeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
     tts = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY"),
         voice_id=os.getenv("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
     )
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
+    llm = CovalOpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
 
     llm.register_function("get_current_time", tool_get_current_time)
     llm.register_function("get_weather", tool_get_weather)

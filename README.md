@@ -9,10 +9,12 @@ When a conversation happens, Pipecat automatically emits structured spans:
 ```
 conversation
 └── turn
-    ├── stt    — transcription, TTFB
-    ├── llm    — model, input/output text, token counts, TTFB
+    ├── stt    — transcript, stt.confidence, TTFB
+    ├── llm    — model, input/output text, token counts, llm.finish_reason, TTFB
     └── tts    — voice_id, text, TTFB
 ```
+
+The example wraps Pipecat's built-in traced Deepgram/OpenAI services so these attributes land on the standard `stt` and `llm` spans instead of creating duplicate custom spans.
 
 These land in Coval's ClickHouse `otel.otel_traces` table, tagged with the simulation output ID. You can view them at:
 - Internal: `https://app.coval.dev/<org>/runs/<run_id>/results/<sim_id>/traces-internal`
