@@ -84,9 +84,11 @@ class _CovalSpanRenamer(SpanProcessor):
         elif name.startswith("function_call"):
             span._name = "llm_tool_call"
 
-        # Set default finish_reason on LLM spans; subclassed services override to "tool_calls"
-        effective_name = span._name if hasattr(span, "_name") else name
-        if effective_name == "llm":
+        # Set default finish_reason on LLM spans; subclassed services override to "tool_calls".
+        # Check both the original name (for Pipecat's @traced_llm which creates spans as "llm")
+        # and the renamed name (for spans renamed from "llm_request" → "llm").
+        effective_name = getattr(span, "_name", name)
+        if effective_name == "llm" or name == "llm":
             span.set_attribute("llm.finish_reason", "stop")
             _current_llm_span.set(span)
 
