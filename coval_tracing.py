@@ -221,19 +221,33 @@ def _begin_tracing_context() -> str:
 
 
 def setup_coval_tracing(service_name: str = "coval-agent") -> None:
-    """Initialize OpenTelemetry tracing for Coval."""
+    """Initialize OpenTelemetry tracing for Coval.
+
+    If a TracerProvider already exists (e.g., set up by the cloud runtime),
+    we attach our processors to it rather than creating a new one.
+    """
     global _router
     if not COVAL_API_KEY:
         logger.warning("COVAL_API_KEY not set — tracing disabled")
         return
     if _router is None:
         _router = _ContextualCovalExporter(api_key=COVAL_API_KEY)
-        resource = Resource.create({SERVICE_NAME: service_name})
-        provider = TracerProvider(resource=resource)
-        provider.add_span_processor(_CovalSpanRenamer())
-        provider.add_span_processor(SimpleSpanProcessor(_router))
-        trace.set_tracer_provider(provider)
-        logger.info("Coval tracing initialized — waiting for simulation ID")
+
+        # Check if the global provider is already a real TracerProvider
+        # (set by Pipecat Cloud, LiveKit Cloud, or other runtime)
+        existing = trace.get_tracer_provider()
+        if isinstance(existing, TracerProvider):
+            existing.add_span_processor(_CovalSpanRenamer())
+            existing.add_span_processor(SimpleSpanProcessor(_router))
+            logger.info("Coval tracing attached to existing TracerProvider")
+        else:
+            # No existing provider — create our own
+            resource = Resource.create({SERVICE_NAME: service_name})
+            provider = TracerProvider(resource=resource)
+            provider.add_span_processor(_CovalSpanRenamer())
+            provider.add_span_processor(SimpleSpanProcessor(_router))
+            trace.set_tracer_provider(provider)
+            logger.info("Coval tracing initialized with new TracerProvider")
     else:
         logger.info("Coval tracing reset — waiting for simulation ID")
     _begin_tracing_context()
