@@ -16,6 +16,9 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from loguru import logger
 
+from opentelemetry import trace as otel_trace
+from pipecat.utils.tracing.service_decorators import traced_stt
+
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import EndFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -27,7 +30,53 @@ from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.daily.transport import DailyDialinSettings, DailyParams, DailyTransport
 
+from coval_tracing import setup_coval_tracing, set_simulation_id, get_current_llm_span
+
 load_dotenv(override=True)
+
+
+# ── Instrumented service subclasses (TRACE-10) ──────────────────────────────
+
+
+class InstrumentedDeepgramSTT(DeepgramSTTService):
+    """DeepgramSTTService with real ASR confidence and provider sub-spans."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._last_confidence: float = 0.0
+
+    async def _on_message(self, *args, **kwargs):
+        result = kwargs.get("result")
+        if result and hasattr(result, "channel"):
+            alts = getattr(result.channel, "alternatives", [])
+            if alts:
+                self._last_confidence = getattr(alts[0], "confidence", 0.0)
+        await super()._on_message(*args, **kwargs)
+
+    @traced_stt
+    async def _handle_transcription(self, transcript, is_final, language=None):
+        span = otel_trace.get_current_span()
+        if span and span.is_recording():
+            span.set_attribute("stt.confidence", self._last_confidence)
+            tracer = otel_trace.get_tracer("coval.instrumentation")
+            with tracer.start_as_current_span("stt.provider.deepgram") as p:
+                p.set_attribute("stt.providerName", "deepgram")
+                p.set_attribute("stt.confidence", self._last_confidence)
+                ttfb = getattr(getattr(self, "_metrics", None), "ttfb", None)
+                if ttfb is not None:
+                    p.set_attribute("metrics.ttfb", ttfb)
+            with tracer.start_as_current_span("stt.provider_selection") as sel:
+                sel.set_attribute("stt.selectedProvider", "deepgram")
+
+
+class InstrumentedOpenAILLM(OpenAILLMService):
+    """OpenAILLMService that sets llm.finish_reason='tool_calls' when tools are invoked."""
+
+    async def run_function_calls(self, function_calls):
+        llm_span = get_current_llm_span()
+        if llm_span and llm_span.is_recording():
+            llm_span.set_attribute("llm.finish_reason", "tool_calls")
+        return await super().run_function_calls(function_calls)
 
 SYSTEM_PROMPT = """You are a helpful voice assistant used for testing Coval's voice agent evaluation platform.
 Keep your responses concise and conversational. You have access to tools — use them when relevant:
@@ -189,6 +238,15 @@ async def bot(args: Any) -> None:
 
     @transport.event_handler("on_dialin_connected")
     async def on_dialin_connected(transport, data):
+        # Extract simulation ID from SIP headers or body
+        sip_headers = (data.get("sipHeaders") or data.get("sip_headers") or {})
+        sim_id = sip_headers.get("X-Coval-Simulation-Id") or sip_headers.get("x-coval-simulation-id")
+        if not sim_id:
+            body = data.get("body") or {}
+            sim_id = body.get("dialin_settings", {}).get("sip_headers", {}).get("X-Coval-Simulation-Id")
+        if sim_id:
+            set_simulation_id(str(sim_id))
+            logger.info(f"Coval tracing active — sim_id={sim_id}")
         logger.info(f"Dialin CONNECTED — data: {data}")
 
     @transport.event_handler("on_dialin_stopped")
@@ -199,9 +257,11 @@ async def bot(args: Any) -> None:
     async def on_dialin_error(transport, data):
         logger.error(f"Dialin ERROR — data: {data}")
 
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    setup_coval_tracing(service_name="pipecat-voice-agent")
+
+    stt = InstrumentedDeepgramSTT(api_key=os.getenv("DEEPGRAM_API_KEY"))
     tts = DeepgramTTSService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
+    llm = InstrumentedOpenAILLM(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
 
     llm.register_function("get_current_time", tool_get_current_time)
     llm.register_function("get_weather", tool_get_weather)
@@ -227,6 +287,7 @@ async def bot(args: Any) -> None:
         params=PipelineParams(
             allow_interruptions=True,
             enable_metrics=True,
+            enable_tracing=True,
         ),
     )
 
