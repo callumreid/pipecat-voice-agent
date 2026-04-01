@@ -115,23 +115,19 @@ class InstrumentedOpenAILLM(OpenAILLMService):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._called_tools = False
+        self._llm_span_ref = None
+
+    async def start_llm_usage_metrics(self, tokens):
+        # Called within the @traced_llm span — capture span ref and set default
+        self._llm_span_ref = otel_trace.get_current_span()
+        if self._llm_span_ref and self._llm_span_ref.is_recording():
+            self._llm_span_ref.set_attribute("llm.finish_reason", "stop")
+        await super().start_llm_usage_metrics(tokens)
 
     async def run_function_calls(self, function_calls):
-        self._called_tools = True
-        span = otel_trace.get_current_span()
-        if span and span.is_recording():
-            span.set_attribute("llm.finish_reason", "tool_calls")
+        if self._llm_span_ref and self._llm_span_ref.is_recording():
+            self._llm_span_ref.set_attribute("llm.finish_reason", "tool_calls")
         return await super().run_function_calls(function_calls)
-
-    async def _process_context(self, context):
-        self._called_tools = False
-        result = await super()._process_context(context)
-        span = otel_trace.get_current_span()
-        if span and span.is_recording():
-            finish_reason = "tool_calls" if self._called_tools else "stop"
-            span.set_attribute("llm.finish_reason", finish_reason)
-        return result
 
 
 SYSTEM_PROMPT = """You are a helpful voice assistant used for testing Coval's voice agent evaluation platform.

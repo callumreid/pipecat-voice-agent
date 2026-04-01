@@ -70,29 +70,32 @@ class InstrumentedDeepgramSTT(DeepgramSTTService):
 
 
 class InstrumentedOpenAILLM(OpenAILLMService):
-    """OpenAILLMService that sets llm.finish_reason on the active LLM span."""
+    """OpenAILLMService that sets llm.finish_reason on the active LLM span.
+
+    The @traced_llm decorator on _process_context creates the LLM span.
+    run_function_calls is called via direct await within that span context,
+    so get_current_span() works there (before task creation breaks context).
+    We capture the span ref in start_llm_usage_metrics (called within span)
+    and set finish_reason in run_function_calls.
+    """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._called_tools = False
+        self._llm_span_ref = None
+
+    async def start_llm_usage_metrics(self, tokens):
+        # This is called within the @traced_llm span (the decorator wraps it).
+        # Capture the span reference here — it's guaranteed to be within context.
+        self._llm_span_ref = otel_trace.get_current_span()
+        if self._llm_span_ref and self._llm_span_ref.is_recording():
+            self._llm_span_ref.set_attribute("llm.finish_reason", "stop")
+        await super().start_llm_usage_metrics(tokens)
 
     async def run_function_calls(self, function_calls):
-        self._called_tools = True
-        # Also try setting via current span directly
-        span = otel_trace.get_current_span()
-        if span and span.is_recording():
-            span.set_attribute("llm.finish_reason", "tool_calls")
+        # Override finish_reason to tool_calls using the captured span ref
+        if self._llm_span_ref and self._llm_span_ref.is_recording():
+            self._llm_span_ref.set_attribute("llm.finish_reason", "tool_calls")
         return await super().run_function_calls(function_calls)
-
-    async def _process_context(self, context):
-        self._called_tools = False
-        result = await super()._process_context(context)
-        # Set finish_reason after processing — the @traced_llm span is still open
-        span = otel_trace.get_current_span()
-        if span and span.is_recording():
-            finish_reason = "tool_calls" if self._called_tools else "stop"
-            span.set_attribute("llm.finish_reason", finish_reason)
-        return result
 
 SYSTEM_PROMPT = """You are a helpful voice assistant used for testing Coval's voice agent evaluation platform.
 Keep your responses concise and conversational. You have access to tools — use them when relevant:
