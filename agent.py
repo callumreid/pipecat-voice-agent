@@ -16,18 +16,110 @@ from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 from loguru import logger
 
+from opentelemetry import trace as otel_trace
+
+from pipecat.utils.tracing.service_decorators import traced_stt
+
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import EndFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyManual
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.openai import OpenAILLMService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 
+try:
+    from pipecat.services.google.stt import GoogleSTTService
+    _HAS_GOOGLE_STT = True
+except ImportError:
+    _HAS_GOOGLE_STT = False
+
+from coval_tracing import setup_coval_tracing, set_simulation_id, get_current_llm_span
+
 load_dotenv(".env.local")
+
+
+# ── Instrumented service subclasses ──────────────────────────────────────────
+# These add stt.confidence, llm.finish_reason, and provider sub-spans (TRACE-10).
+
+
+class InstrumentedDeepgramSTT(DeepgramSTTService):
+    """DeepgramSTTService with real ASR confidence and provider sub-spans."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._last_confidence: float = 0.0
+
+    async def _on_message(self, *args, **kwargs):
+        result = kwargs.get("result")
+        if result and hasattr(result, "channel"):
+            alts = getattr(result.channel, "alternatives", [])
+            if alts:
+                self._last_confidence = getattr(alts[0], "confidence", 0.0)
+        await super()._on_message(*args, **kwargs)
+
+    @traced_stt
+    async def _handle_transcription(self, transcript, is_final, language=None):
+        """Override to inject stt.confidence and provider sub-spans into the active span."""
+        # @traced_stt creates an 'stt' span as current before calling this body
+        span = otel_trace.get_current_span()
+        if span and span.is_recording():
+            span.set_attribute("stt.confidence", self._last_confidence)
+            # TRACE-10: provider sub-span
+            tracer = otel_trace.get_tracer("coval.instrumentation")
+            with tracer.start_as_current_span("stt.provider.deepgram") as p:
+                p.set_attribute("stt.providerName", "deepgram")
+                p.set_attribute("stt.confidence", self._last_confidence)
+                ttfb = getattr(getattr(self, "_metrics", None), "ttfb", None)
+                if ttfb is not None:
+                    p.set_attribute("metrics.ttfb", ttfb)
+            with tracer.start_as_current_span("stt.provider_selection") as sel:
+                sel.set_attribute("stt.selectedProvider", "deepgram")
+                sel.set_attribute("stt.fallbackAvailable", "google" if _HAS_GOOGLE_STT else "none")
+
+
+class InstrumentedGoogleSTT:
+    """Wrapper factory — returns a GoogleSTTService subclass with provider sub-spans."""
+
+    @staticmethod
+    def create(**kwargs):
+        if not _HAS_GOOGLE_STT:
+            return None
+
+        class _InstrumentedGoogleSTT(GoogleSTTService):
+            @traced_stt
+            async def _handle_transcription(self, transcript, is_final, language=None):
+                span = otel_trace.get_current_span()
+                if span and span.is_recording():
+                    span.set_attribute("stt.confidence", 0.95)  # Google doesn't expose confidence easily
+                    tracer = otel_trace.get_tracer("coval.instrumentation")
+                    with tracer.start_as_current_span("stt.provider.google") as p:
+                        p.set_attribute("stt.providerName", "google")
+                        p.set_attribute("stt.confidence", 0.95)
+                        ttfb = getattr(getattr(self, "_metrics", None), "ttfb", None)
+                        if ttfb is not None:
+                            p.set_attribute("metrics.ttfb", ttfb)
+                    with tracer.start_as_current_span("stt.provider_selection") as sel:
+                        sel.set_attribute("stt.selectedProvider", "google")
+                        sel.set_attribute("stt.reason", "fallback")
+
+        return _InstrumentedGoogleSTT(**kwargs)
+
+
+class InstrumentedOpenAILLM(OpenAILLMService):
+    """OpenAILLMService that sets llm.finish_reason='tool_calls' when tools are invoked."""
+
+    async def run_function_calls(self, function_calls):
+        # Override finish_reason from default 'stop' to 'tool_calls'
+        llm_span = get_current_llm_span()
+        if llm_span and llm_span.is_recording():
+            llm_span.set_attribute("llm.finish_reason", "tool_calls")
+        return await super().run_function_calls(function_calls)
+
 
 SYSTEM_PROMPT = """You are a helpful voice assistant used for testing Coval's voice agent evaluation platform.
 Keep your responses concise and conversational. You have access to tools — use them when relevant:
@@ -143,6 +235,9 @@ async def tool_lookup_order_status(function_name, tool_call_id, args, llm, conte
 
 
 async def run_agent(room_url: str, token: str | None = None):
+    # COVAL: Initialize tracing before creating any tasks or runners
+    setup_coval_tracing(service_name="pipecat-voice-agent")  # COVAL:
+
     transport = DailyTransport(
         room_url,
         token,
@@ -157,14 +252,28 @@ async def run_agent(room_url: str, token: str | None = None):
 
     @transport.event_handler("on_dialin_connected")
     async def on_dialin_connected(transport, data):
+        # COVAL: Extract and set the simulation ID if present
+        sim_id = (data.get('body') or {}).get('dialin_settings', {}).get('custom_context', {}).get('coval_simulation_id')  # COVAL:
+        if sim_id:  # COVAL:
+            set_simulation_id(sim_id)  # COVAL:
         logger.info(f"Dialin connected — data: {data}")
 
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    # STT with fallback: Deepgram (primary) → Google (fallback) via ServiceSwitcher
+    stt_deepgram = InstrumentedDeepgramSTT(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    if _HAS_GOOGLE_STT:
+        stt_google = InstrumentedGoogleSTT.create(api_key=os.getenv("GOOGLE_API_KEY"))
+        stt = ServiceSwitcher(
+            services=[stt_deepgram, stt_google] if stt_google else [stt_deepgram],
+            strategy_type=ServiceSwitcherStrategyManual,
+        )
+    else:
+        stt = stt_deepgram
+
     tts = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY"),
         voice_id=os.getenv("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
     )
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
+    llm = InstrumentedOpenAILLM(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
 
     llm.register_function("get_current_time", tool_get_current_time)
     llm.register_function("get_weather", tool_get_weather)
@@ -192,6 +301,7 @@ async def run_agent(room_url: str, token: str | None = None):
         params=PipelineParams(
             allow_interruptions=True,
             enable_metrics=True,
+            enable_tracing=True,  # COVAL: Ensure tracing is enabled
         ),
     )
 

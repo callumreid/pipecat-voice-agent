@@ -1,8 +1,7 @@
 pipecatcloud
-pipecat-ai[daily,deepgram,openai,cartesia,silero]>=0.0.60
+pipecat-ai[daily,deepgram,openai,cartesia,silero,google]>=0.0.60
 python-dotenv>=1.0.0
 loguru>=0.7.0
 opentelemetry-api>=1.20.0
 opentelemetry-sdk>=1.20.0
-opentelemetry-exporter-otlp-proto-http>=1.20.0
 duckduckgo-search>=8.1.1
