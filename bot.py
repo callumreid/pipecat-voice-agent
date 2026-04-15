@@ -11,8 +11,11 @@ Tracing: DynamicCovalExporter buffers spans until simulation_id is known.
 """
 
 import asyncio
+import json
 import os
 import random
+import threading
+import time
 from datetime import datetime
 from typing import Any, Optional, Sequence
 
@@ -50,6 +53,9 @@ Keep your responses concise and conversational. You have access to tools — use
 - lookup_order_status: looks up a mock order by order ID"""
 
 COVAL_TRACES_ENDPOINT = "https://api.coval.dev/v1/traces"
+COVAL_API_KEYS_JSON = os.environ.get("COVAL_API_KEYS_JSON", "")
+COVAL_API_KEYS_FILE = os.environ.get("COVAL_API_KEYS_FILE", "")
+COVAL_API_KEYS_REFRESH_SECONDS = max(float(os.environ.get("COVAL_API_KEYS_REFRESH_SECONDS", "30")), 0.0)
 
 
 # ── Tracing ────────────────────────────────────────────────────────────────────
@@ -102,37 +108,229 @@ def _span_to_otlp_json(span: ReadableSpan) -> dict:
     }
 
 
-class _CovalJSONExporter(SpanExporter):
-    """Sends spans as OTLP JSON via plain HTTP. Avoids protobuf binary encoding
-    issues with API Gateway binary media type configuration."""
+class _ApiKeyStore:
+    """Loads Coval trace API keys from file, JSON, or env vars.
 
-    def __init__(self, api_key: str, simulation_id: str, endpoint: str, timeout: int):
-        self._api_key = api_key
-        self._simulation_id = simulation_id
+    Resolution order: COVAL_API_KEYS_FILE (auto-refreshed) > COVAL_API_KEYS_JSON >
+    COVAL_API_KEY_<LABEL> env vars > legacy COVAL_API_KEY (labeled "default").
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._cached_items: list[tuple[str, str]] = []
+        self._last_checked_at = 0.0
+        self._file_mtime: Optional[float] = None
+
+    def get_items(self) -> list[tuple[str, str]]:
+        with self._lock:
+            if COVAL_API_KEYS_FILE:
+                self._refresh_from_file_if_needed()
+                return list(self._cached_items)
+
+            if not self._cached_items:
+                self._cached_items = self._load_static_items()
+            return list(self._cached_items)
+
+    def _refresh_from_file_if_needed(self) -> None:
+        now = time.time()
+        if self._cached_items and now - self._last_checked_at < COVAL_API_KEYS_REFRESH_SECONDS:
+            return
+
+        self._last_checked_at = now
+        try:
+            stat = os.stat(COVAL_API_KEYS_FILE)
+        except OSError as exc:
+            if not self._cached_items:
+                logger.warning(f"Unable to read COVAL_API_KEYS_FILE={COVAL_API_KEYS_FILE}: {exc}")
+            return
+
+        if self._file_mtime == stat.st_mtime and self._cached_items:
+            return
+
+        try:
+            with open(COVAL_API_KEYS_FILE, "r", encoding="utf-8") as handle:
+                parsed = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(f"Failed to parse COVAL_API_KEYS_FILE={COVAL_API_KEYS_FILE}: {exc}")
+            return
+
+        loaded = self._items_from_mapping(parsed)
+        if loaded:
+            self._cached_items = loaded
+            self._file_mtime = stat.st_mtime
+            logger.info(f"Loaded {len(loaded)} Coval trace API key(s) from {COVAL_API_KEYS_FILE}")
+
+    def _load_static_items(self) -> list[tuple[str, str]]:
+        if COVAL_API_KEYS_JSON:
+            try:
+                parsed = json.loads(COVAL_API_KEYS_JSON)
+            except json.JSONDecodeError as exc:
+                logger.warning(f"Failed to parse COVAL_API_KEYS_JSON: {exc}")
+            else:
+                loaded = self._items_from_mapping(parsed)
+                if loaded:
+                    return loaded
+
+        env_items: list[tuple[str, str]] = []
+        for env_name, raw_value in sorted(os.environ.items()):
+            if not env_name.startswith("COVAL_API_KEY_") or env_name.startswith("COVAL_API_KEYS_"):
+                continue
+            value = raw_value.strip()
+            suffix = env_name[len("COVAL_API_KEY_") :].strip()
+            if not suffix or not value:
+                continue
+            env_items.append((suffix.lower().replace("_", "-"), value))
+
+        if env_items:
+            return env_items
+
+        api_key = os.getenv("COVAL_API_KEY", "").strip()
+        if api_key:
+            return [("default", api_key)]
+
+        return []
+
+    def _items_from_mapping(self, mapping: object) -> list[tuple[str, str]]:
+        if not isinstance(mapping, dict):
+            logger.warning("Ignoring Coval key config because it is not a JSON object")
+            return []
+
+        items: list[tuple[str, str]] = []
+        for raw_label, raw_value in mapping.items():
+            label = str(raw_label).strip()
+            value = str(raw_value).strip() if raw_value is not None else ""
+            if not label or not value:
+                continue
+            items.append((label, value))
+        return items
+
+
+_api_key_store = _ApiKeyStore()
+
+
+def _spans_to_otlp_json(spans: Sequence[ReadableSpan]) -> dict:
+    resource_spans = []
+    for span in spans:
+        resource_spans.extend(_span_to_otlp_json(span)["resourceSpans"])
+    return {"resourceSpans": resource_spans}
+
+
+class _TraceKeyRouter:
+    """Selects the correct org-scoped Coval API key per simulation.
+
+    POSTs to /v1/traces with each configured key until one returns 200, then
+    caches the winning label per simulation_id so subsequent spans skip the
+    fan-out. 401/403/404 are treated as 'wrong org, try next'; 429/5xx are
+    transient and bubble up as failure (no key is cached).
+    """
+
+    def __init__(self, endpoint: str, timeout: int):
         self._endpoint = endpoint
         self._timeout = timeout
+        self._lock = threading.RLock()
+        self._selected_label_by_simulation: dict[str, str] = {}
+
+    def has_keys(self) -> bool:
+        return bool(_api_key_store.get_items())
+
+    def export(self, spans: Sequence[ReadableSpan], simulation_id: str) -> SpanExportResult:
+        payload = _spans_to_otlp_json(spans)
+        if not payload["resourceSpans"]:
+            return SpanExportResult.SUCCESS
+        return SpanExportResult.SUCCESS if self._export_payload(payload, simulation_id) else SpanExportResult.FAILURE
+
+    def _export_payload(self, payload: dict, simulation_id: str) -> bool:
+        items = _api_key_store.get_items()
+        if not items:
+            logger.warning("No Coval trace API keys configured")
+            return False
+
+        configured = dict(items)
+        cached_label = self._selected_label_by_simulation.get(simulation_id)
+        if cached_label and cached_label in configured:
+            success, outcome = self._post_payload(payload, simulation_id, cached_label, configured[cached_label])
+            if success:
+                return True
+            if outcome != "mismatch":
+                return False
+            with self._lock:
+                self._selected_label_by_simulation.pop(simulation_id, None)
+
+        for label, api_key in items:
+            if label == cached_label:
+                continue
+            success, outcome = self._post_payload(payload, simulation_id, label, api_key)
+            if success:
+                with self._lock:
+                    self._selected_label_by_simulation[simulation_id] = label
+                logger.info(f"Selected Coval trace API key '{label}' for simulation_id={simulation_id}")
+                return True
+            if outcome == "mismatch":
+                continue
+            return False
+
+        logger.error(f"No configured Coval trace API key matched simulation_id={simulation_id}")
+        return False
+
+    def _post_payload(self, payload: dict, simulation_id: str, label: str, api_key: str) -> tuple[bool, str]:
+        try:
+            resp = requests.post(
+                self._endpoint,
+                json=payload,
+                headers={"x-api-key": api_key, "X-Simulation-Id": simulation_id},
+                timeout=self._timeout,
+            )
+        except requests.RequestException as error:
+            logger.warning(f"Coval trace export exception using key '{label}': {error}")
+            return False, "retry"
+
+        if resp.ok:
+            return True, "success"
+        if resp.status_code in (401, 403, 404):
+            return False, "mismatch"
+        if resp.status_code == 429 or resp.status_code >= 500:
+            logger.warning(f"Retryable Coval trace export failure {resp.status_code} using key '{label}'")
+            return False, "retry"
+        logger.error(f"Coval trace export failed {resp.status_code} using key '{label}': {resp.text}")
+        return False, "fatal"
+
+
+class DynamicCovalExporter(SpanExporter):
+    """OTLP span exporter that buffers spans until the Coval simulation ID is known.
+
+    Configured before the pipeline starts so Pipecat's conversation root span is
+    captured from the start. When set_simulation_id() is called (on SIP dialin),
+    all buffered spans are flushed via the multi-org router and subsequent spans
+    export normally.
+
+    reset() clears state between sessions on the same warm process instance.
+    """
+
+    def __init__(self, endpoint: str = COVAL_TRACES_ENDPOINT, timeout: int = 30):
+        self._endpoint = endpoint
+        self._timeout = timeout
+        self._simulation_id: Optional[str] = None
+        self._router = _TraceKeyRouter(endpoint=endpoint, timeout=timeout)
+        self._buffer: list[ReadableSpan] = []
+
+    def reset(self) -> None:
+        """Clear state for a new session (called at the start of each bot() invocation)."""
+        self._simulation_id = None
+        self._buffer.clear()
+
+    def set_simulation_id(self, simulation_id: str) -> None:
+        self._simulation_id = simulation_id
+        if self._buffer:
+            logger.info(f"Flushing {len(self._buffer)} buffered spans to Coval")
+            result = self._router.export(self._buffer, simulation_id)
+            logger.info(f"Buffered span flush result: {result}")
+            self._buffer.clear()
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-        for span in spans:
-            try:
-                payload = _span_to_otlp_json(span)
-                resp = requests.post(
-                    self._endpoint,
-                    json=payload,
-                    headers={
-                        "x-api-key": self._api_key,
-                        "X-Simulation-Id": self._simulation_id,
-                    },
-                    timeout=self._timeout,
-                )
-                if not resp.ok:
-                    logger.error(f"Coval trace export failed {resp.status_code}: {resp.text}")
-                    return SpanExportResult.FAILURE
-                else:
-                    logger.debug(f"Exported span '{span.name}' → {resp.status_code}")
-            except Exception as error:
-                logger.error(f"Coval trace export exception: {error}")
-                return SpanExportResult.FAILURE
+        if self._simulation_id:
+            return self._router.export(spans, self._simulation_id)
+        logger.debug(f"Buffering {len(spans)} spans (no simulation_id yet)")
+        self._buffer.extend(spans)
         return SpanExportResult.SUCCESS
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
@@ -142,58 +340,6 @@ class _CovalJSONExporter(SpanExporter):
         pass
 
 
-class DynamicCovalExporter(SpanExporter):
-    """OTLP span exporter that buffers spans until the Coval simulation ID is known.
-
-    Configured before the pipeline starts so Pipecat's conversation root span is
-    captured from the start. When set_simulation_id() is called (on SIP dialin),
-    all buffered spans are flushed to Coval and subsequent spans export normally.
-
-    reset() clears state between sessions on the same warm process instance.
-    """
-
-    def __init__(self, api_key: str, endpoint: str = COVAL_TRACES_ENDPOINT, timeout: int = 30):
-        self._api_key = api_key
-        self._endpoint = endpoint
-        self._timeout = timeout
-        self._inner: Optional[_CovalJSONExporter] = None
-        self._buffer: list[ReadableSpan] = []
-
-    def reset(self) -> None:
-        """Clear state for a new session (called at the start of each bot() invocation)."""
-        self._inner = None
-        self._buffer.clear()
-
-    def set_simulation_id(self, simulation_id: str) -> None:
-        self._inner = _CovalJSONExporter(
-            api_key=self._api_key,
-            simulation_id=simulation_id,
-            endpoint=self._endpoint,
-            timeout=self._timeout,
-        )
-        if self._buffer:
-            logger.info(f"Flushing {len(self._buffer)} buffered spans to Coval")
-            result = self._inner.export(self._buffer)
-            logger.info(f"Buffered span flush result: {result}")
-            self._buffer.clear()
-
-    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-        if self._inner:
-            return self._inner.export(spans)
-        logger.debug(f"Buffering {len(spans)} spans (no simulation_id yet)")
-        self._buffer.extend(spans)
-        return SpanExportResult.SUCCESS
-
-    def force_flush(self, timeout_millis: int = 30000) -> bool:
-        if self._inner:
-            return self._inner.force_flush(timeout_millis)
-        return True
-
-    def shutdown(self) -> None:
-        if self._inner:
-            self._inner.shutdown()
-
-
 # Tracing is set up once per process (Pipecat Cloud reuses warm instances across calls).
 # reset() is called at the start of each bot() invocation to clear per-session state.
 _coval_exporter: Optional[DynamicCovalExporter] = None
@@ -201,11 +347,10 @@ _coval_exporter: Optional[DynamicCovalExporter] = None
 
 def _init_tracing() -> None:
     global _coval_exporter
-    api_key = os.getenv("COVAL_API_KEY")
-    if not api_key:
-        logger.warning("COVAL_API_KEY not set — tracing disabled")
+    if not _api_key_store.get_items():
+        logger.warning("No Coval trace API keys configured — tracing disabled")
         return
-    _coval_exporter = DynamicCovalExporter(api_key=api_key)
+    _coval_exporter = DynamicCovalExporter()
     resource = Resource.create({SERVICE_NAME: "pipecat-voice-agent"})
     provider = TracerProvider(resource=resource)
     provider.add_span_processor(SimpleSpanProcessor(_coval_exporter))
