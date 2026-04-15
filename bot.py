@@ -43,8 +43,8 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.services.cartesia import CartesiaTTSService
-from pipecat.services.openai import OpenAISTTService
+from pipecat.services.openai.stt import OpenAISTTService
+from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.daily.transport import (
     DailyDialinSettings,
     DailyParams,
@@ -698,14 +698,14 @@ async def bot(args: Any) -> None:
         else:
             logger.warning("No simulation_id — spans will be discarded")
 
-    # Deepgram's live STT websocket has been intermittently rejecting this test
-    # agent even when the API key passes basic auth checks. Use provider paths
-    # that are healthy with the current test-agent credentials instead.
+    # Use OpenAI for both STT and TTS — the test-agent Deepgram live STT was
+    # rejecting auth and the test-agent Cartesia account exhausted credits
+    # (TTS websocket returning HTTP 402). OpenAI is the one provider that's
+    # healthy end-to-end with current test-agent credentials.
     stt = OpenAISTTService(api_key=os.getenv("OPENAI_API_KEY"))
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id=os.getenv("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
-        cartesia_version=os.getenv("CARTESIA_VERSION", "2026-03-01"),
+    tts = OpenAITTSService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        voice=os.getenv("OPENAI_TTS_VOICE", "alloy"),
     )
     llm = CovalOpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini"
