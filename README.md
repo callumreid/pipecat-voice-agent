@@ -14,7 +14,7 @@ conversation
     └── tts    — voice_id, text, TTFB
 ```
 
-The example wraps Pipecat's built-in traced Deepgram/OpenAI services so these attributes land on the standard `stt` and `llm` spans instead of creating duplicate custom spans.
+The example uses Pipecat's built-in traced OpenAI and Cartesia services, plus a small OpenAI LLM wrapper, so these attributes land on the standard `stt`, `llm`, and `tts` spans instead of creating duplicate custom spans.
 
 These land in Coval's ClickHouse `otel.otel_traces` table, tagged with the simulation output ID. You can view them at:
 - Internal: `https://app.coval.dev/<org>/runs/<run_id>/results/<sim_id>/traces-internal`
@@ -25,7 +25,7 @@ These land in Coval's ClickHouse `otel.otel_traces` table, tagged with the simul
 | Component | Provider |
 |---|---|
 | Transport | Daily (WebRTC) |
-| STT | Deepgram |
+| STT | OpenAI |
 | LLM | OpenAI GPT-4o-mini |
 | TTS | Cartesia |
 | Tracing | OpenTelemetry → Coval |
@@ -49,7 +49,7 @@ Go to [Daily dashboard](https://dashboard.daily.co/) and create a room, or use t
 **4. Configure environment:**
 ```bash
 cp .env.example .env.local
-# Fill in DAILY_ROOM_URL, OPENAI_API_KEY, DEEPGRAM_API_KEY, CARTESIA_API_KEY, COVAL_API_KEY
+# Fill in DAILY_ROOM_URL, OPENAI_API_KEY, CARTESIA_API_KEY, COVAL_API_KEY
 ```
 
 **5. Before each test run, set the simulation ID:**

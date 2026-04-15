@@ -21,7 +21,6 @@ from typing import Any, Optional, Sequence
 
 import requests
 from coval_trace_instrumentation import (
-    CovalDeepgramSTTService,
     CovalOpenAILLMService,
 )
 from dotenv import load_dotenv
@@ -40,7 +39,8 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.services.deepgram.tts import DeepgramTTSService
+from pipecat.services.cartesia import CartesiaTTSService
+from pipecat.services.openai import OpenAISTTService
 from pipecat.transports.daily.transport import DailyDialinSettings, DailyParams, DailyTransport
 
 load_dotenv(override=True)
@@ -557,8 +557,15 @@ async def bot(args: Any) -> None:
         else:
             logger.warning("No simulation_id — spans will be discarded")
 
-    stt = CovalDeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-    tts = DeepgramTTSService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    # Deepgram's live STT websocket has been intermittently rejecting this test
+    # agent even when the API key passes basic auth checks. Use provider paths
+    # that are healthy with the current test-agent credentials instead.
+    stt = OpenAISTTService(api_key=os.getenv("OPENAI_API_KEY"))
+    tts = CartesiaTTSService(
+        api_key=os.getenv("CARTESIA_API_KEY"),
+        voice_id=os.getenv("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
+        cartesia_version=os.getenv("CARTESIA_VERSION", "2026-03-01"),
+    )
     llm = CovalOpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
 
     llm.register_function("get_current_time", tool_get_current_time)

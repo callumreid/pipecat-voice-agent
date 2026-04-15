@@ -1,0 +1,11 @@
+agent_name = "coval-pipecat-agent-ddbd"
+
+# Same image as the primary agent — no code changes needed, just different secrets (API key).
+image = "callumcoval/coval-pipecat-agent:latest"
+
+# Secrets created via: pcc secrets set --skip coval-pipecat-secrets-ddbd KEY=value ...
+secret_set = "coval-pipecat-secrets-ddbd"
+
+[scaling]
+min_agents = 1
+max_agents = 5
