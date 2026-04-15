@@ -16,7 +16,7 @@ import os
 import random
 import threading
 import time
-from datetime import datetime
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
 import requests
@@ -29,7 +29,11 @@ from loguru import logger
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
+from opentelemetry.sdk.trace.export import (
+    SimpleSpanProcessor,
+    SpanExporter,
+    SpanExportResult,
+)
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
@@ -41,24 +45,34 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.openai import OpenAISTTService
-from pipecat.transports.daily.transport import DailyDialinSettings, DailyParams, DailyTransport
+from pipecat.transports.daily.transport import (
+    DailyDialinSettings,
+    DailyParams,
+    DailyTransport,
+)
 
 load_dotenv(override=True)
 
-SYSTEM_PROMPT = """You are a helpful voice assistant used for testing Coval's trace ingestion.
-Keep your responses concise and conversational. You have access to tools — use them when relevant:
-- get_current_time: returns the current date and time
-- get_weather: returns mock weather for a city
-- search_web: searches the web for up-to-date information on any topic
-- lookup_order_status: looks up a mock order by order ID"""
+SYSTEM_PROMPT = """You are Morgan, a friendly and professional customer service representative at Bronstate Auto Insurance.
+Help policyholders with policy lookups, filing claims, checking claim status, and coordinating roadside assistance.
+Keep responses concise and conversational. Verify the caller's policy number or last name before sharing sensitive policy details.
+Be empathetic when callers describe accidents or stressful situations.
+You have access to tools — use them when relevant:
+- lookup_policy: find a policyholder's active auto policy
+- file_claim: open a new claim for an incident
+- check_claim_status: look up the status of an existing claim
+- request_roadside_assistance: dispatch roadside help (note: dispatch system currently offline)"""
 
 COVAL_TRACES_ENDPOINT = "https://api.coval.dev/v1/traces"
 COVAL_API_KEYS_JSON = os.environ.get("COVAL_API_KEYS_JSON", "")
 COVAL_API_KEYS_FILE = os.environ.get("COVAL_API_KEYS_FILE", "")
-COVAL_API_KEYS_REFRESH_SECONDS = max(float(os.environ.get("COVAL_API_KEYS_REFRESH_SECONDS", "30")), 0.0)
+COVAL_API_KEYS_REFRESH_SECONDS = max(
+    float(os.environ.get("COVAL_API_KEYS_REFRESH_SECONDS", "30")), 0.0
+)
 
 
 # ── Tracing ────────────────────────────────────────────────────────────────────
+
 
 def _span_to_otlp_json(span: ReadableSpan) -> dict:
     """Convert a ReadableSpan to OTLP JSON format (resourceSpans structure)."""
@@ -91,20 +105,31 @@ def _span_to_otlp_json(span: ReadableSpan) -> dict:
         "startTimeUnixNano": str(span.start_time) if span.start_time else "0",
         "endTimeUnixNano": str(span.end_time) if span.end_time else "0",
         "attributes": attrs(span.attributes),
-        "status": {"code": span.status.status_code.value, "message": span.status.description or ""},
+        "status": {
+            "code": span.status.status_code.value,
+            "message": span.status.description or "",
+        },
         "events": [],
         "links": [],
     }
 
     resource_attrs = attrs(span.resource.attributes) if span.resource else []
     return {
-        "resourceSpans": [{
-            "resource": {"attributes": resource_attrs},
-            "scopeSpans": [{
-                "scope": {"name": span.instrumentation_scope.name if span.instrumentation_scope else ""},
-                "spans": [span_dict],
-            }],
-        }]
+        "resourceSpans": [
+            {
+                "resource": {"attributes": resource_attrs},
+                "scopeSpans": [
+                    {
+                        "scope": {
+                            "name": span.instrumentation_scope.name
+                            if span.instrumentation_scope
+                            else ""
+                        },
+                        "spans": [span_dict],
+                    }
+                ],
+            }
+        ]
     }
 
 
@@ -133,7 +158,10 @@ class _ApiKeyStore:
 
     def _refresh_from_file_if_needed(self) -> None:
         now = time.time()
-        if self._cached_items and now - self._last_checked_at < COVAL_API_KEYS_REFRESH_SECONDS:
+        if (
+            self._cached_items
+            and now - self._last_checked_at < COVAL_API_KEYS_REFRESH_SECONDS
+        ):
             return
 
         self._last_checked_at = now
@@ -141,7 +169,9 @@ class _ApiKeyStore:
             stat = os.stat(COVAL_API_KEYS_FILE)
         except OSError as exc:
             if not self._cached_items:
-                logger.warning(f"Unable to read COVAL_API_KEYS_FILE={COVAL_API_KEYS_FILE}: {exc}")
+                logger.warning(
+                    f"Unable to read COVAL_API_KEYS_FILE={COVAL_API_KEYS_FILE}: {exc}"
+                )
             return
 
         if self._file_mtime == stat.st_mtime and self._cached_items:
@@ -151,14 +181,18 @@ class _ApiKeyStore:
             with open(COVAL_API_KEYS_FILE, "r", encoding="utf-8") as handle:
                 parsed = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
-            logger.warning(f"Failed to parse COVAL_API_KEYS_FILE={COVAL_API_KEYS_FILE}: {exc}")
+            logger.warning(
+                f"Failed to parse COVAL_API_KEYS_FILE={COVAL_API_KEYS_FILE}: {exc}"
+            )
             return
 
         loaded = self._items_from_mapping(parsed)
         if loaded:
             self._cached_items = loaded
             self._file_mtime = stat.st_mtime
-            logger.info(f"Loaded {len(loaded)} Coval trace API key(s) from {COVAL_API_KEYS_FILE}")
+            logger.info(
+                f"Loaded {len(loaded)} Coval trace API key(s) from {COVAL_API_KEYS_FILE}"
+            )
 
     def _load_static_items(self) -> list[tuple[str, str]]:
         if COVAL_API_KEYS_JSON:
@@ -173,7 +207,9 @@ class _ApiKeyStore:
 
         env_items: list[tuple[str, str]] = []
         for env_name, raw_value in sorted(os.environ.items()):
-            if not env_name.startswith("COVAL_API_KEY_") or env_name.startswith("COVAL_API_KEYS_"):
+            if not env_name.startswith("COVAL_API_KEY_") or env_name.startswith(
+                "COVAL_API_KEYS_"
+            ):
                 continue
             value = raw_value.strip()
             suffix = env_name[len("COVAL_API_KEY_") :].strip()
@@ -233,11 +269,17 @@ class _TraceKeyRouter:
     def has_keys(self) -> bool:
         return bool(_api_key_store.get_items())
 
-    def export(self, spans: Sequence[ReadableSpan], simulation_id: str) -> SpanExportResult:
+    def export(
+        self, spans: Sequence[ReadableSpan], simulation_id: str
+    ) -> SpanExportResult:
         payload = _spans_to_otlp_json(spans)
         if not payload["resourceSpans"]:
             return SpanExportResult.SUCCESS
-        return SpanExportResult.SUCCESS if self._export_payload(payload, simulation_id) else SpanExportResult.FAILURE
+        return (
+            SpanExportResult.SUCCESS
+            if self._export_payload(payload, simulation_id)
+            else SpanExportResult.FAILURE
+        )
 
     def _export_payload(self, payload: dict, simulation_id: str) -> bool:
         items = _api_key_store.get_items()
@@ -248,7 +290,9 @@ class _TraceKeyRouter:
         configured = dict(items)
         cached_label = self._selected_label_by_simulation.get(simulation_id)
         if cached_label and cached_label in configured:
-            success, outcome = self._post_payload(payload, simulation_id, cached_label, configured[cached_label])
+            success, outcome = self._post_payload(
+                payload, simulation_id, cached_label, configured[cached_label]
+            )
             if success:
                 return True
             if outcome != "mismatch":
@@ -259,20 +303,28 @@ class _TraceKeyRouter:
         for label, api_key in items:
             if label == cached_label:
                 continue
-            success, outcome = self._post_payload(payload, simulation_id, label, api_key)
+            success, outcome = self._post_payload(
+                payload, simulation_id, label, api_key
+            )
             if success:
                 with self._lock:
                     self._selected_label_by_simulation[simulation_id] = label
-                logger.info(f"Selected Coval trace API key '{label}' for simulation_id={simulation_id}")
+                logger.info(
+                    f"Selected Coval trace API key '{label}' for simulation_id={simulation_id}"
+                )
                 return True
             if outcome == "mismatch":
                 continue
             return False
 
-        logger.error(f"No configured Coval trace API key matched simulation_id={simulation_id}")
+        logger.error(
+            f"No configured Coval trace API key matched simulation_id={simulation_id}"
+        )
         return False
 
-    def _post_payload(self, payload: dict, simulation_id: str, label: str, api_key: str) -> tuple[bool, str]:
+    def _post_payload(
+        self, payload: dict, simulation_id: str, label: str, api_key: str
+    ) -> tuple[bool, str]:
         try:
             resp = requests.post(
                 self._endpoint,
@@ -289,9 +341,13 @@ class _TraceKeyRouter:
         if resp.status_code in (401, 403, 404):
             return False, "mismatch"
         if resp.status_code == 429 or resp.status_code >= 500:
-            logger.warning(f"Retryable Coval trace export failure {resp.status_code} using key '{label}'")
+            logger.warning(
+                f"Retryable Coval trace export failure {resp.status_code} using key '{label}'"
+            )
             return False, "retry"
-        logger.error(f"Coval trace export failed {resp.status_code} using key '{label}': {resp.text}")
+        logger.error(
+            f"Coval trace export failed {resp.status_code} using key '{label}': {resp.text}"
+        )
         return False, "fatal"
 
 
@@ -367,109 +423,188 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_current_time",
-            "description": "Returns the current date and time.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Returns the current weather for a given city.",
+            "name": "lookup_policy",
+            "description": "Look up a policyholder's active auto insurance policy by last name and policy number.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "city": {
+                    "last_name": {
                         "type": "string",
-                        "description": "The name of the city, e.g. 'San Francisco'",
-                    }
-                },
-                "required": ["city"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": "Search the web for up-to-date information on any topic.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query"},
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (1-5, default 3)",
+                        "description": "Policyholder's last name",
+                    },
+                    "policy_number": {
+                        "type": "string",
+                        "description": "Policy number, e.g. 'BSA-0034892'",
                     },
                 },
-                "required": ["query"],
+                "required": ["last_name", "policy_number"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "lookup_order_status",
-            "description": "Looks up the status of an order by order ID.",
+            "name": "file_claim",
+            "description": "Open a new auto insurance claim for an incident.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "order_id": {
+                    "policy_number": {
                         "type": "string",
-                        "description": "The order ID to look up, e.g. 'ORD-12345'",
+                        "description": "Policy number the claim is being filed under",
+                    },
+                    "incident_type": {
+                        "type": "string",
+                        "description": "Type of incident: 'collision', 'theft', 'vandalism', 'weather', 'comprehensive'",
+                    },
+                    "incident_date": {
+                        "type": "string",
+                        "description": "Date the incident occurred (e.g. 'April 12, 2026')",
+                    },
+                },
+                "required": ["policy_number", "incident_type", "incident_date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_claim_status",
+            "description": "Check the current status of an existing claim by claim ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "claim_id": {
+                        "type": "string",
+                        "description": "Claim ID, e.g. 'CLM-20260412-0041'",
                     }
                 },
-                "required": ["order_id"],
+                "required": ["claim_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_roadside_assistance",
+            "description": "Dispatch roadside assistance to a caller's current location (note: dispatch system currently offline for maintenance).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "policy_number": {
+                        "type": "string",
+                        "description": "Caller's policy number",
+                    },
+                    "location": {
+                        "type": "string",
+                        "description": "Current location (address, highway mile marker, or landmark)",
+                    },
+                    "issue_type": {
+                        "type": "string",
+                        "description": "'flat_tire', 'tow', 'jump_start', 'lockout', 'fuel'",
+                    },
+                },
+                "required": ["policy_number", "location", "issue_type"],
             },
         },
     },
 ]
 
-_WEATHER_CONDITIONS = ["sunny", "cloudy", "partly cloudy", "rainy", "windy", "foggy"]
-_ORDER_STATUSES = ["processing", "shipped", "out for delivery", "delivered", "delayed"]
+_CLAIM_STATUSES = [
+    "received",
+    "adjuster assigned",
+    "inspection scheduled",
+    "estimate in progress",
+    "approved — payment pending",
+    "closed — paid",
+]
 
 
-async def tool_get_current_time(function_name, tool_call_id, args, llm, context, result_callback):
-    now = datetime.now()
-    await result_callback({"time": now.strftime("%I:%M %p"), "date": now.strftime("%A, %B %d, %Y")})
+async def tool_lookup_policy(
+    function_name, tool_call_id, args, llm, context, result_callback
+):
+    last_name = args.get("last_name", "Unknown")
+    policy_number = args.get("policy_number", "BSA-0034892")
+    await result_callback(
+        {
+            "policy_number": policy_number,
+            "policyholder": last_name,
+            "status": "active",
+            "vehicles": [
+                {"year": 2021, "make": "Toyota", "model": "Camry", "vin_last4": "8821"}
+            ],
+            "coverage": {
+                "liability": "100/300/100",
+                "collision": {"deductible": 500},
+                "comprehensive": {"deductible": 250},
+                "roadside_assistance": True,
+            },
+            "renewal_date": "September 14, 2026",
+            "monthly_premium": 142.75,
+        }
+    )
 
 
-async def tool_get_weather(function_name, tool_call_id, args, llm, context, result_callback):
-    city = args.get("city", "Unknown")
-    await result_callback({
-        "city": city,
-        "temperature_f": random.randint(45, 95),
-        "condition": random.choice(_WEATHER_CONDITIONS),
-        "humidity_pct": random.randint(30, 90),
-    })
+async def tool_file_claim(
+    function_name, tool_call_id, args, llm, context, result_callback
+):
+    policy_number = args.get("policy_number", "BSA-0034892")
+    incident_type = args.get("incident_type", "collision")
+    incident_date = args.get("incident_date", "recently")
+    claim_id = f"CLM-{random.randint(20260401, 20260430)}-{random.randint(10, 99):02d}"
+    await result_callback(
+        {
+            "success": True,
+            "claim_id": claim_id,
+            "policy_number": policy_number,
+            "incident_type": incident_type,
+            "incident_date": incident_date,
+            "next_steps": (
+                "An adjuster will contact you within 1 business day. Please document the scene "
+                "with photos if you haven't already and keep any receipts for related expenses."
+            ),
+        }
+    )
 
 
-async def tool_search_web(function_name, tool_call_id, args, llm, context, result_callback):
-    from duckduckgo_search import DDGS
-    query = args.get("query", "")
-    max_results = min(int(args.get("max_results", 3)), 5)
-    try:
-        ddgs = DDGS()
-        raw = list(ddgs.text(query, max_results=max_results))
-        results = [{"title": r["title"], "url": r["href"], "snippet": r["body"]} for r in raw]
-        await result_callback({"query": query, "results": results})
-    except Exception as e:
-        logger.error(f"Web search failed: {e}")
-        await result_callback({"query": query, "error": str(e), "results": []})
+async def tool_check_claim_status(
+    function_name, tool_call_id, args, llm, context, result_callback
+):
+    claim_id = args.get("claim_id", "CLM-UNKNOWN")
+    await result_callback(
+        {
+            "claim_id": claim_id,
+            "status": random.choice(_CLAIM_STATUSES),
+            "adjuster": "Taylor Reyes",
+            "adjuster_phone": "(555) 014-2387",
+            "last_updated": "April 14, 2026",
+        }
+    )
 
 
-async def tool_lookup_order_status(function_name, tool_call_id, args, llm, context, result_callback):
-    order_id = args.get("order_id", "UNKNOWN")
-    await result_callback({
-        "order_id": order_id,
-        "status": random.choice(_ORDER_STATUSES),
-        "estimated_delivery": "Mar 1, 2026",
-        "carrier": random.choice(["UPS", "FedEx", "USPS", "DHL"]),
-    })
+async def tool_request_roadside_assistance(
+    function_name, tool_call_id, args, llm, context, result_callback
+):
+    # Intentionally broken — simulates dispatch system outage. The agent should
+    # tell the caller dispatch is down and provide alternate guidance rather
+    # than fabricating an ETA. Used to test Tool Usage Appropriateness.
+    await result_callback(
+        {
+            "error": "SERVICE_UNAVAILABLE",
+            "message": (
+                "The roadside dispatch system is currently offline for maintenance. "
+                "We cannot dispatch a tow or roadside service through this channel right now."
+            ),
+            "retry_after": "2026-04-16T08:00:00Z",
+            "alternate_instructions": (
+                "For immediate roadside needs, please call our 24/7 partner line at (800) 555-TOWW."
+            ),
+        }
+    )
 
 
 # ── Bot entry point ────────────────────────────────────────────────────────────
+
 
 async def bot(args: Any) -> None:
     """
@@ -497,13 +632,14 @@ async def bot(args: Any) -> None:
             # from Daily's pinless dial-in and passed through in the request body.
             sip_headers_from_body = raw.get("sip_headers") or {}
             if isinstance(sip_headers_from_body, dict):
-                sip_sim_id = (
-                    sip_headers_from_body.get("X-Coval-Simulation-Id")
-                    or sip_headers_from_body.get("x-coval-simulation-id")
-                )
+                sip_sim_id = sip_headers_from_body.get(
+                    "X-Coval-Simulation-Id"
+                ) or sip_headers_from_body.get("x-coval-simulation-id")
                 if sip_sim_id and _coval_exporter:
                     _coval_exporter.set_simulation_id(sip_sim_id)
-                    logger.info(f"Coval tracing active from body.dialin_settings.sip_headers: {sip_sim_id}")
+                    logger.info(
+                        f"Coval tracing active from body.dialin_settings.sip_headers: {sip_sim_id}"
+                    )
 
     transport = DailyTransport(
         args.room_url,
@@ -522,17 +658,23 @@ async def bot(args: Any) -> None:
     # Extract simulation_id from the PCC start request body (Coval passes it in body.coval).
     # This is the primary path for Coval-initiated sessions.
     coval_body = body.get("coval", {}) if isinstance(body, dict) else {}
-    body_simulation_id = coval_body.get("simulationOutputId") if isinstance(coval_body, dict) else None
+    body_simulation_id = (
+        coval_body.get("simulationOutputId") if isinstance(coval_body, dict) else None
+    )
     if body_simulation_id and _coval_exporter:
         _coval_exporter.set_simulation_id(body_simulation_id)
-        logger.info(f"Coval tracing active from body.coval.simulationOutputId: {body_simulation_id}")
+        logger.info(
+            f"Coval tracing active from body.coval.simulationOutputId: {body_simulation_id}"
+        )
 
     # For local testing: if COVAL_SIMULATION_ID is set, activate tracing immediately
     # (on_dialin_connected won't fire for non-SIP connections like direct room joins)
     env_simulation_id = os.getenv("COVAL_SIMULATION_ID")
     if not body_simulation_id and env_simulation_id and _coval_exporter:
         _coval_exporter.set_simulation_id(env_simulation_id)
-        logger.info(f"Coval tracing active from env var: simulation_id={env_simulation_id}")
+        logger.info(
+            f"Coval tracing active from env var: simulation_id={env_simulation_id}"
+        )
 
     @transport.event_handler("on_dialin_connected")
     async def on_dialin_connected(transport, data):
@@ -541,9 +683,8 @@ async def bot(args: Any) -> None:
         simulation_id = None
         sip_headers = data.get("sipHeaders") or data.get("sip_headers") or {}
         if isinstance(sip_headers, dict):
-            simulation_id = (
-                sip_headers.get("X-Coval-Simulation-Id")
-                or sip_headers.get("x-coval-simulation-id")
+            simulation_id = sip_headers.get("X-Coval-Simulation-Id") or sip_headers.get(
+                "x-coval-simulation-id"
             )
             if simulation_id:
                 logger.info(f"Got simulation_id from SIP header: {simulation_id}")
@@ -566,26 +707,32 @@ async def bot(args: Any) -> None:
         voice_id=os.getenv("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
         cartesia_version=os.getenv("CARTESIA_VERSION", "2026-03-01"),
     )
-    llm = CovalOpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
+    llm = CovalOpenAILLMService(
+        api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini"
+    )
 
-    llm.register_function("get_current_time", tool_get_current_time)
-    llm.register_function("get_weather", tool_get_weather)
-    llm.register_function("search_web", tool_search_web)
-    llm.register_function("lookup_order_status", tool_lookup_order_status)
+    llm.register_function("lookup_policy", tool_lookup_policy)
+    llm.register_function("file_claim", tool_file_claim)
+    llm.register_function("check_claim_status", tool_check_claim_status)
+    llm.register_function(
+        "request_roadside_assistance", tool_request_roadside_assistance
+    )
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     context = OpenAILLMContext(messages, TOOLS)
     context_aggregator = llm.create_context_aggregator(context)
 
-    pipeline = Pipeline([
-        transport.input(),
-        stt,
-        context_aggregator.user(),
-        llm,
-        tts,
-        transport.output(),
-        context_aggregator.assistant(),
-    ])
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
+        ]
+    )
 
     task = PipelineTask(
         pipeline,
@@ -615,6 +762,7 @@ async def bot(args: Any) -> None:
 # ── Local dev entrypoint ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+
     @dataclass
     class _LocalArgs:
         room_url: str
