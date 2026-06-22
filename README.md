@@ -84,3 +84,37 @@ For automated simulations, this ID flows in from the SIP INVITE or room metadata
 ## Connecting to Coval
 
 For a Coval simulation to dial into this agent, configure the agent in Coval to point to the Daily room. Coval joins as a participant and drives the conversation. Ensure the agent is running and joined to the room before the simulation starts.
+
+## Outbound Voice / Media-Ready Testing
+
+The Fly webhook also supports Coval `MODEL_TYPE_OUTBOUND_VOICE` tests:
+
+- `trigger_call_endpoint`: `https://coval-sip-webhook.fly.dev/`
+- `phone_number_key`: `phone_number`
+- `media_ready_endpoint`: `https://coval-sip-webhook.fly.dev/media-ready`
+
+When Coval POSTs the trigger payload, the webhook starts `coval-pipecat-agent` on Pipecat Cloud with Daily dial-out enabled. The bot dials the Coval persona phone number and waits to speak its first greeting until Coval POSTs the media-ready callback.
+
+The callback payload is the SIM-462 backend contract:
+
+```json
+{
+  "simulation_output_id": "<simulation-output-id>",
+  "phone_number": "+15551234567",
+  "call_control_id": "<telnyx-call-control-id>",
+  "stream_id": "<telnyx-stream-id>",
+  "media_ready": true,
+  "event": "coval.media_ready"
+}
+```
+
+Deploy both components after changing this flow:
+
+```bash
+docker buildx build --platform linux/arm64 --load -t callumcoval/coval-pipecat-agent:latest .
+docker push callumcoval/coval-pipecat-agent:latest
+pcc deploy --force --yes --no-credentials
+flyctl deploy -c fly.webhook.toml
+```
+
+`pcc` must be authenticated to Pipecat Cloud and `flyctl` must be authenticated to Fly. If either token is missing or expired, run `pcc auth login` and `flyctl auth login` first.

@@ -53,8 +53,18 @@ from pipecat.transports.daily.transport import (
 
 load_dotenv(override=True)
 
+try:
+    from pipecatcloud_system import app
+except ModuleNotFoundError:
+    from fastapi import FastAPI
+
+    # pipecatcloud_system is injected by the Pipecat Cloud runtime. A local
+    # FastAPI app keeps imports and route tests working outside PCC.
+    app = FastAPI()
+
 SYSTEM_PROMPT = """You are Morgan, a friendly and professional customer service representative at Bronstate Auto Insurance.
 Help policyholders with policy lookups, filing claims, checking claim status, and coordinating roadside assistance.
+When a new call starts, greet the caller first with: "Hello, this is Morgan from Bronstate Auto Insurance. How can I help today?"
 Keep responses concise and conversational. Verify the caller's policy number or last name before sharing sensitive policy details.
 Be empathetic when callers describe accidents or stressful situations.
 You have access to tools — use them when relevant:
@@ -400,6 +410,112 @@ class DynamicCovalExporter(SpanExporter):
 # reset() is called at the start of each bot() invocation to clear per-session state.
 _coval_exporter: Optional[DynamicCovalExporter] = None
 
+_initial_greeting_lock = asyncio.Lock()
+_current_task: Optional[PipelineTask] = None
+_current_initial_frame_factory: Any = None
+_current_wait_for_media_ready = False
+_current_media_ready_received = False
+_current_participant_joined = False
+_current_initial_greeting_started = False
+_current_simulation_id: Optional[str] = None
+
+
+def _extract_simulation_id_from_payload(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("simulation_output_id", "simulationOutputId", "coval_simulation_output_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    coval = payload.get("coval")
+    if isinstance(coval, dict):
+        return _extract_simulation_id_from_payload(coval)
+    return None
+
+
+def _normalize_dialout_settings(raw_settings: Any) -> Optional[dict[str, Any]]:
+    if isinstance(raw_settings, list):
+        raw_settings = raw_settings[0] if raw_settings else None
+    if not isinstance(raw_settings, dict):
+        return None
+
+    phone_number = raw_settings.get("phoneNumber") or raw_settings.get("phone_number")
+    if not isinstance(phone_number, str) or not phone_number.strip():
+        return None
+
+    settings: dict[str, Any] = {
+        "phoneNumber": phone_number.strip(),
+        "displayName": raw_settings.get("displayName") or raw_settings.get("display_name") or "Coval Persona",
+    }
+    caller_id = raw_settings.get("callerId") or raw_settings.get("caller_id")
+    if isinstance(caller_id, str) and caller_id.strip():
+        settings["callerId"] = caller_id.strip()
+    return settings
+
+
+def _reset_media_ready_state(wait_for_media_ready: bool, simulation_id: Optional[str]) -> None:
+    global _current_task
+    global _current_initial_frame_factory
+    global _current_wait_for_media_ready
+    global _current_media_ready_received
+    global _current_participant_joined
+    global _current_initial_greeting_started
+    global _current_simulation_id
+
+    _current_task = None
+    _current_initial_frame_factory = None
+    _current_wait_for_media_ready = wait_for_media_ready
+    _current_media_ready_received = False
+    _current_participant_joined = False
+    _current_initial_greeting_started = False
+    _current_simulation_id = simulation_id
+
+
+async def _queue_initial_greeting(reason: str) -> dict[str, Any]:
+    global _current_initial_greeting_started
+
+    async with _initial_greeting_lock:
+        if _current_initial_greeting_started:
+            return {"status": "ok", "greeting": "already_started", "reason": reason}
+        if _current_task is None or _current_initial_frame_factory is None:
+            return {"status": "pending", "greeting": "no_active_task", "reason": reason}
+
+        frame = _current_initial_frame_factory()
+        _current_initial_greeting_started = True
+        await _current_task.queue_frames([frame])
+        logger.info(f"Queued initial greeting: reason={reason}")
+        return {"status": "ok", "greeting": "started", "reason": reason}
+
+
+@app.post("/media-ready")
+async def media_ready(payload: dict[str, Any]):
+    """Session API endpoint called after Coval has connected its media stream."""
+    global _current_media_ready_received
+
+    callback_simulation_id = _extract_simulation_id_from_payload(payload)
+    if (
+        _current_simulation_id
+        and callback_simulation_id
+        and callback_simulation_id != _current_simulation_id
+    ):
+        logger.warning(
+            f"Ignoring media-ready callback for simulation_id={callback_simulation_id}; "
+            f"active simulation_id={_current_simulation_id}"
+        )
+        return {
+            "status": "ignored",
+            "error": "simulation_id_mismatch",
+            "active_simulation_id": _current_simulation_id,
+            "callback_simulation_id": callback_simulation_id,
+        }
+
+    _current_media_ready_received = True
+    logger.info(f"Received media-ready callback: simulation_id={callback_simulation_id}")
+
+    if _current_participant_joined:
+        return await _queue_initial_greeting("media_ready")
+    return {"status": "ok", "greeting": "waiting_for_participant"}
+
 
 def _init_tracing() -> None:
     global _coval_exporter
@@ -618,6 +734,22 @@ async def bot(args: Any) -> None:
 
     # Extract dialin_settings from body (passed by PCC's pinless dial-in webhook)
     body = getattr(args, "body", None) or {}
+    coval_body = body.get("coval", {}) if isinstance(body, dict) else {}
+    body_simulation_id = (
+        coval_body.get("simulationOutputId") if isinstance(coval_body, dict) else None
+    )
+    dialout_settings = (
+        _normalize_dialout_settings(body.get("dialout_settings"))
+        if isinstance(body, dict)
+        else None
+    )
+    wait_for_media_ready = bool(
+        dialout_settings
+        and isinstance(coval_body, dict)
+        and coval_body.get("waitForMediaReady")
+    )
+    _reset_media_ready_state(wait_for_media_ready, body_simulation_id)
+
     dialin_settings = None
     if isinstance(body, dict):
         raw = body.get("dialin_settings")
@@ -647,6 +779,7 @@ async def bot(args: Any) -> None:
         "Pipecat Test Agent",
         DailyParams(
             api_key=os.getenv("DAILY_API_KEY", ""),
+            audio_in_enabled=True,
             audio_out_enabled=True,
             transcription_enabled=False,
             vad_enabled=True,
@@ -657,10 +790,6 @@ async def bot(args: Any) -> None:
 
     # Extract simulation_id from the PCC start request body (Coval passes it in body.coval).
     # This is the primary path for Coval-initiated sessions.
-    coval_body = body.get("coval", {}) if isinstance(body, dict) else {}
-    body_simulation_id = (
-        coval_body.get("simulationOutputId") if isinstance(coval_body, dict) else None
-    )
     if body_simulation_id and _coval_exporter:
         _coval_exporter.set_simulation_id(body_simulation_id)
         logger.info(
@@ -697,6 +826,17 @@ async def bot(args: Any) -> None:
             logger.info(f"Coval tracing active for simulation_id={simulation_id}")
         else:
             logger.warning("No simulation_id — spans will be discarded")
+
+    @transport.event_handler("on_joined")
+    async def on_joined(transport, data):
+        logger.info(f"Daily room joined: {data}")
+        if not dialout_settings:
+            return
+        session_id, error = await transport.start_dialout(dialout_settings)
+        if error:
+            logger.error(f"Daily dial-out failed to start: {error}")
+            return
+        logger.info(f"Daily dial-out started: session_id={session_id}")
 
     # Use OpenAI for both STT and TTS — the test-agent Deepgram live STT was
     # rejecting auth and the test-agent Cartesia account exhausted credits
@@ -744,10 +884,20 @@ async def bot(args: Any) -> None:
         enable_turn_tracking=True,
     )
 
+    global _current_task
+    global _current_initial_frame_factory
+    _current_task = task
+    _current_initial_frame_factory = context_aggregator.user().get_context_frame
+
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport, participant):
+        global _current_participant_joined
         logger.info(f"Participant joined: {participant.get('id')}")
-        await task.queue_frames([context_aggregator.user().get_context_frame()])
+        _current_participant_joined = True
+        if wait_for_media_ready and not _current_media_ready_received:
+            logger.info("Waiting for media-ready callback before initial greeting")
+            return
+        await _queue_initial_greeting("participant_joined")
 
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
@@ -756,7 +906,11 @@ async def bot(args: Any) -> None:
 
     handle_sigint = getattr(args, "handle_sigint", False)
     runner = PipelineRunner(handle_sigint=handle_sigint)
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    finally:
+        if _current_task is task:
+            _reset_media_ready_state(False, None)
 
 
 # ── Local dev entrypoint ───────────────────────────────────────────────────────
